@@ -499,8 +499,13 @@ class Norns:
                 model = f"{self._llm_provider}/{raw_model}"
             else:
                 model = raw_model
-            system_prompt = task.get("system_prompt", "")
-            messages = task.get("messages", [])
+            # Core sends the def's prompt verbatim and never writes prose for
+            # the model: the worker composes the prompt, renders kinded
+            # messages, elides old tool results, and decides the final output.
+            system_prompt = _compose_system_prompt(task)
+            messages = _elide_old_tool_results(
+                [_render_message(m) for m in task.get("messages", [])]
+            )
             tools = task.get("tools", [])
 
             # Prepend system prompt as a system message
@@ -518,7 +523,9 @@ class Norns:
                 kwargs["tools"] = _to_litellm_tools(tools)
 
             response = await asyncio.to_thread(litellm.completion, **kwargs)
-            return _from_litellm_response(response)
+            result = _from_litellm_response(response)
+            result["final_output"] = _final_output(messages, result.get("content", ""))
+            return result
 
         except Exception as e:
             logger.error(f"LLM error: {e}")
@@ -879,6 +886,106 @@ def _parse_agent(data: dict) -> AgentResponse:
     )
 
 
+# Chars kept of a tool result once it has aged out of the last two messages.
+# A context-cost policy, applied here because the worker is what holds the
+# plaintext; core forwards results untouched.
+TOOL_RESULT_CAP = 200
+
+
+def _compose_system_prompt(task: dict) -> str:
+    """The prompt the model sees: the def's prompt verbatim, then the
+    conversation summary and the date the orchestrator put in the envelope."""
+    prompt = task.get("system_prompt") or ""
+    summary = task.get("summary")
+    date = task.get("date")
+    if isinstance(summary, str) and summary:
+        prompt += "\n\nSummary of earlier conversation: " + summary
+    if date:
+        prompt += f"\n\nCurrent date: {date}."
+    return prompt
+
+
+def _render_message(msg: dict) -> dict:
+    """Render a kinded message — one the orchestrator resolved itself — to
+    plain content. Messages without a kind pass through untouched."""
+    kind = msg.get("kind")
+    if not kind:
+        return msg
+    out = {k: v for k, v in msg.items() if k not in ("kind", "data")}
+    out["content"] = _render_kind(kind, msg.get("data") or {}, msg.get("content"))
+    return out
+
+
+def _encode(value) -> str:
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def _render_kind(kind: str, data: dict, content) -> str:
+    if kind == "inherited_context":
+        return "[Inherited context from parent agent]\n" + _encode(content)
+    if kind == "timer_completed":
+        return "Timer completed."
+    if kind == "tool_denied":
+        return f"Tool '{data.get('tool_name')}' is not in this agent's allowed tools."
+    if kind == "subagent_denied":
+        reason = data.get("reason")
+        if reason == "disabled":
+            return "This agent is not permitted to launch sub-agents."
+        if reason == "max_depth":
+            return (
+                f"Sub-agent nesting limit reached (max depth {data.get('max_depth')}). "
+                "Do the work in this agent instead of delegating further."
+            )
+        return f"Agent '{data.get('agent_name')}' is not in this agent's allowed sub-agents."
+    if kind == "subagent_list_denied":
+        return "Listing agents is not permitted for this agent."
+    if kind == "subagent_not_found":
+        return f"Agent '{data.get('agent_name')}' not found"
+    if kind == "subagent_self":
+        return "Cannot launch self as a sub-agent"
+    if kind == "subagent_missing":
+        return f"Sub-agent run {data.get('run_id')} no longer exists, so its result cannot be recovered."
+    if kind == "subagent_launch_failed":
+        return f"Failed to launch agent '{data.get('agent_name')}': {data.get('reason')}"
+    if kind == "subagent_completed":
+        return json.dumps({"run_id": data.get("run_id"), "status": "completed", "output": content or ""})
+    if kind == "subagent_failed":
+        return json.dumps({"run_id": data.get("run_id"), "status": "failed", "error": content or ""})
+    if kind == "list_agents":
+        return json.dumps(data.get("agents") or [])
+    if content in (None, ""):
+        return _encode(data)
+    return _encode(content)
+
+
+def _elide_old_tool_results(messages: list[dict]) -> list[dict]:
+    """Cap tool results older than the last two messages."""
+    if len(messages) <= 4:
+        return messages
+    old, recent = messages[:-2], messages[-2:]
+    out = []
+    for msg in old:
+        content = msg.get("content")
+        if msg.get("role") == "tool" and isinstance(content, str) and len(content) > TOOL_RESULT_CAP:
+            msg = {**msg, "content": content[:TOOL_RESULT_CAP] + "...(truncated)"}
+        out.append(msg)
+    return out + recent
+
+
+def _final_output(messages: list[dict], content) -> str:
+    """The run's output when the model stops. A turn can say something
+    substantive alongside a tool call and then end with an empty "stop" turn;
+    fall back to the last non-empty assistant text rather than losing it."""
+    text = content if isinstance(content, str) else ""
+    if text.strip():
+        return text
+    for msg in reversed(messages):
+        c = msg.get("content")
+        if msg.get("role") == "assistant" and isinstance(c, str) and c.strip():
+            return c
+    return text
+
+
 def _to_litellm_messages(messages: list[dict]) -> list[dict]:
     """Translate neutral-format messages to LiteLLM/OpenAI format.
 
@@ -916,6 +1023,11 @@ def _to_litellm_messages(messages: list[dict]) -> list[dict]:
                 "content": msg.get("content", ""),
             })
         else:
+            content = msg.get("content")
+            if isinstance(content, dict):
+                # An opaque block this worker holds no key for, or structured
+                # content: send it encoded rather than crash the call.
+                msg = {**msg, "content": json.dumps(content)}
             result.append(msg)
 
     return result

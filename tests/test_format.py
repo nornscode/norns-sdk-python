@@ -117,3 +117,135 @@ def test_from_litellm_multiple_tool_calls():
     assert len(result["tool_calls"]) == 2
     assert result["tool_calls"][0]["name"] == "search"
     assert result["tool_calls"][1]["name"] == "lookup"
+
+
+# --- Opaque content: the worker composes, renders, elides, decides ---
+
+from norns.client import (  # noqa: E402
+    _compose_system_prompt,
+    _elide_old_tool_results,
+    _final_output,
+    _render_message,
+    _to_litellm_messages,
+)
+
+
+def test_compose_system_prompt_appends_summary_and_date():
+    prompt = _compose_system_prompt({
+        "system_prompt": "You help.",
+        "summary": "User likes cats.",
+        "date": "2026-09-09",
+    })
+    assert prompt == "You help.\n\nSummary of earlier conversation: User likes cats.\n\nCurrent date: 2026-09-09."
+
+
+def test_compose_system_prompt_verbatim_without_envelope_fields():
+    assert _compose_system_prompt({"system_prompt": "You help."}) == "You help."
+    assert _compose_system_prompt({"system_prompt": "You help.", "summary": ""}) == "You help."
+
+
+def test_render_message_passes_plain_messages_through():
+    msg = {"role": "user", "content": "hi"}
+    assert _render_message(msg) is msg
+
+
+def test_render_inherited_context():
+    out = _render_message({"role": "user", "kind": "inherited_context", "content": {"ticket_id": "T-123"}})
+    assert out["role"] == "user"
+    assert out["content"] == '[Inherited context from parent agent]\n{"ticket_id": "T-123"}'
+    assert "kind" not in out
+
+
+def test_render_system_results():
+    base = {"role": "tool", "tool_call_id": "c1", "name": "x", "content": ""}
+    cases = [
+        (("timer_completed", {}, ""), "Timer completed."),
+        (("tool_denied", {"tool_name": "send_email"}, ""), "Tool 'send_email' is not in this agent's allowed tools."),
+        (("subagent_denied", {"agent_name": "kid", "reason": "disabled"}, ""), "This agent is not permitted to launch sub-agents."),
+        (("subagent_denied", {"agent_name": "kid", "reason": "max_depth", "max_depth": 3}, ""),
+            "Sub-agent nesting limit reached (max depth 3). Do the work in this agent instead of delegating further."),
+        (("subagent_denied", {"agent_name": "kid", "reason": "not_allowlisted"}, ""), "Agent 'kid' is not in this agent's allowed sub-agents."),
+        (("subagent_list_denied", {}, ""), "Listing agents is not permitted for this agent."),
+        (("subagent_not_found", {"agent_name": "kid"}, ""), "Agent 'kid' not found"),
+        (("subagent_self", {"agent_name": "me"}, ""), "Cannot launch self as a sub-agent"),
+        (("subagent_missing", {"run_id": 42}, ""), "Sub-agent run 42 no longer exists, so its result cannot be recovered."),
+        (("subagent_launch_failed", {"agent_name": "kid", "reason": ":busy"}, ""), "Failed to launch agent 'kid': :busy"),
+    ]
+    for (kind, data, content), expected in cases:
+        out = _render_message({**base, "kind": kind, "data": data, "content": content})
+        assert out["content"] == expected, kind
+
+
+def test_render_subagent_outcomes_keep_content_and_envelope_apart():
+    done = _render_message({"role": "tool", "kind": "subagent_completed", "data": {"run_id": 7, "status": "completed"}, "content": "42"})
+    assert json.loads(done["content"]) == {"run_id": 7, "status": "completed", "output": "42"}
+    failed = _render_message({"role": "tool", "kind": "subagent_failed", "data": {"run_id": 8, "status": "failed"}, "content": "boom"})
+    assert json.loads(failed["content"]) == {"run_id": 8, "status": "failed", "error": "boom"}
+    listed = _render_message({"role": "tool", "kind": "list_agents", "data": {"agents": [{"name": "a", "purpose": ""}]}, "content": ""})
+    assert json.loads(listed["content"]) == [{"name": "a", "purpose": ""}]
+
+
+def test_elide_old_tool_results_caps_only_aged_results():
+    long = "x" * 500
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "t", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": long},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "name": "t", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": long},
+    ]
+    out = _elide_old_tool_results(messages)
+    assert out[2]["content"] == "x" * 200 + "...(truncated)"
+    assert out[4]["content"] == long  # recent results stay whole
+    assert _elide_old_tool_results(messages[:4]) == messages[:4]  # four or fewer: untouched
+
+
+def test_final_output_falls_back_to_last_substantive_assistant_turn():
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "Here's what I found.", "tool_calls": [{"id": "c1", "name": "t", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r"},
+    ]
+    assert _final_output(messages, "") == "Here's what I found."
+    assert _final_output(messages, "Done.") == "Done."
+    assert _final_output([{"role": "user", "content": "go"}], "  ") == "  "
+
+
+def test_to_litellm_messages_encodes_structured_content_it_cannot_render():
+    block = {"$enc": "v1", "kid": "k", "n": "n", "ct": "c"}
+    out = _to_litellm_messages([{"role": "user", "content": block}])
+    assert json.loads(out[0]["content"]) == block
+
+
+def test_handle_llm_task_composes_renders_and_reports_final_output(monkeypatch):
+    import asyncio
+    from norns.client import Norns
+
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return _make_response(content="", finish_reason="stop")
+
+    monkeypatch.setattr("norns.client.litellm.completion", fake_completion)
+    client = Norns("http://localhost:4000", api_key="k")
+    client._llm_provider = "anthropic"
+
+    task = {
+        "model": "claude-sonnet-5",
+        "system_prompt": "You help.",
+        "summary": "Prior chat.",
+        "date": "2026-09-09",
+        "messages": [
+            {"role": "user", "content": "wait a sec"},
+            {"role": "assistant", "content": "Waiting.", "tool_calls": [{"id": "c1", "name": "wait", "arguments": {"seconds": 1}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "wait", "kind": "timer_completed", "data": {}, "content": ""},
+        ],
+        "tools": [],
+    }
+    result = asyncio.run(client._handle_llm_task(task))
+
+    assert captured["messages"][0] == {"role": "system", "content": "You help.\n\nSummary of earlier conversation: Prior chat.\n\nCurrent date: 2026-09-09."}
+    assert captured["messages"][-1]["content"] == "Timer completed."
+    assert result["status"] == "ok"
+    assert result["final_output"] == "Waiting."
