@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 from collections.abc import Generator
@@ -65,6 +66,8 @@ class Norns:
         self._claim_token: str | None = None
         self._ws = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown: asyncio.Event | None = None
+        self._shutdown_timeout = 30.0
 
     def run(
         self,
@@ -74,11 +77,20 @@ class Norns:
         worker_id: str | None = None,
         gard: str | int | None = None,
         claim_token: str | None = None,
+        shutdown_timeout: float | None = None,
     ):
-        """Connect as a worker, register the agent, and handle tasks forever.
+        """Connect as a worker, register the agent, and handle tasks until
+        told to stop.
 
         Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
+
+        On SIGTERM or SIGINT (or `shutdown()`) the worker drains: it tells
+        Norns to stop sending it work, finishes the tasks it already holds
+        — up to `shutdown_timeout` seconds (default 30, or
+        NORNS_SHUTDOWN_TIMEOUT) — reports their results, leaves the channel,
+        and returns. Tasks still running at the deadline are dropped; Norns
+        re-dispatches them. A second signal exits immediately.
 
         Pass gard and claim_token (both from POST /api/v1/gards, usually
         handed to the worker by the provisioner) to claim a gard: all tool
@@ -110,10 +122,24 @@ class Norns:
             or f"python-worker-{uuid.uuid4().hex[:8]}"
         )
 
+        if shutdown_timeout is None:
+            shutdown_timeout = float(os.environ.get("NORNS_SHUTDOWN_TIMEOUT", "30"))
+        self._shutdown_timeout = shutdown_timeout
+
         try:
             asyncio.run(self._run_loop(agent, wid))
         except KeyboardInterrupt:
+            # Only reachable where signal handlers can't be installed
+            # (Windows, non-main thread): there is no drain, just exit.
             logger.info("Worker shutting down.")
+
+    def shutdown(self):
+        """Ask a running worker to drain and stop. Safe from any thread —
+        a tool handler can call it, and so can a test. `run()` returns
+        once the drain completes."""
+        if self._loop is None or self._shutdown is None:
+            return
+        self._loop.call_soon_threadsafe(self._shutdown.set)
 
     def register_port(
         self,
@@ -185,25 +211,73 @@ class Norns:
             logger.info(f"Created agent '{agent.name}' (id={created['id']})")
 
     async def _run_loop(self, agent: Agent, worker_id: str):
-        """Main event loop: connect, register, handle tasks, reconnect on failure."""
+        """Main event loop: connect, register, handle tasks, reconnect on
+        failure, until shutdown is requested."""
         tools_by_name = {t.name: t for t in agent.tools}
         self._llm_provider = agent.llm_provider
+        self._loop = asyncio.get_running_loop()
+        self._shutdown = asyncio.Event()
+        installed = self._install_signal_handlers()
 
-        while True:
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    await self._connect_and_serve(agent, worker_id, tools_by_name)
+                except (JoinError, GardDestroyed):
+                    # Retrying can never succeed — surface it instead of spinning.
+                    raise
+                except JoinRetryable as e:
+                    if self._shutdown.is_set():
+                        break
+                    logger.warning(f"{e}. Retrying in 3s...")
+                    await self._sleep_unless_shutdown(3)
+                except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
+                    if self._shutdown.is_set():
+                        break
+                    logger.warning(f"Connection lost: {e}. Reconnecting in 3s...")
+                    await self._sleep_unless_shutdown(3)
+                except Exception as e:
+                    if self._shutdown.is_set():
+                        break
+                    logger.error(f"Unexpected error: {e}. Reconnecting in 5s...")
+                    await self._sleep_unless_shutdown(5)
+        finally:
+            for sig in installed:
+                self._loop.remove_signal_handler(sig)
+            self._loop = None
+            self._shutdown = None
+
+        logger.info("Worker stopped.")
+
+    def _install_signal_handlers(self) -> list[signal.Signals]:
+        """Route SIGTERM/SIGINT to a drain. Returns the signals hooked;
+        empty where the loop can't do it (Windows, non-main thread)."""
+        loop = asyncio.get_running_loop()
+        installed = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                await self._connect_and_serve(agent, worker_id, tools_by_name)
-            except (JoinError, GardDestroyed):
-                # Retrying can never succeed — surface it instead of spinning.
-                raise
-            except JoinRetryable as e:
-                logger.warning(f"{e}. Retrying in 3s...")
-                await asyncio.sleep(3)
-            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
-                logger.warning(f"Connection lost: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3)
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
+                loop.add_signal_handler(sig, self._on_signal, sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+            installed.append(sig)
+        return installed
+
+    def _on_signal(self, sig: signal.Signals):
+        logger.info(f"Received {sig.name}: shutting down")
+        if self._shutdown is not None:
+            self._shutdown.set()
+        # A second delivery gets the default action (exit now).
+        try:
+            self._loop.remove_signal_handler(sig)
+            signal.signal(sig, signal.SIG_DFL)
+        except Exception:
+            pass
+
+    async def _sleep_unless_shutdown(self, seconds: float):
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), seconds)
+        except asyncio.TimeoutError:
+            pass
 
     def _join_payload(self, agent: Agent, worker_id: str) -> dict:
         payload = {
@@ -248,7 +322,6 @@ class Norns:
                 logger.info(f"Worker {worker_id} ready")
 
             self._ws = ws
-            self._loop = asyncio.get_running_loop()
 
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
@@ -263,6 +336,10 @@ class Norns:
                 task = asyncio.create_task(coro)
                 in_flight.add(task)
                 task.add_done_callback(in_flight.discard)
+
+            # Drains and closes the socket once shutdown is requested; the
+            # receive loop below then ends because the connection is gone.
+            drain_task = asyncio.create_task(self._drain_on_shutdown(ws, in_flight))
 
             try:
                 async for raw_msg in ws:
@@ -298,11 +375,54 @@ class Norns:
             finally:
                 self._ws = None
                 heartbeat_task.cancel()
+                drain_task.cancel()
                 # In-flight results can't be delivered on the next
                 # connection — the orchestrator re-dispatches on disconnect
-                # and idempotency skips completed side effects.
+                # and idempotency skips completed side effects. (After a
+                # drain this set is empty unless the deadline passed.)
                 for task in in_flight:
                     task.cancel()
+
+    async def _drain_on_shutdown(self, ws, in_flight: set[asyncio.Task]):
+        if self._shutdown is None:  # serving outside run(): nothing to wait for
+            return
+        await self._shutdown.wait()
+
+        logger.info(
+            f"Draining: {len(in_flight)} in-flight task(s), "
+            f"up to {self._shutdown_timeout:g}s"
+        )
+        # Tell Norns to stop dispatching to us. In-flight tasks stay ours;
+        # new ones queue for our replacement.
+        try:
+            await self._push("drain", {})
+        except Exception as e:
+            logger.warning(f"Could not send drain ({e}); Norns will re-dispatch on disconnect")
+
+        # Wait for what we hold, including anything that raced in before
+        # the drain took effect, until the deadline.
+        deadline = time.monotonic() + self._shutdown_timeout
+        while in_flight:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.wait(set(in_flight), timeout=remaining)
+
+        if in_flight:
+            logger.warning(
+                f"{len(in_flight)} task(s) still running at the deadline; "
+                "dropping them — Norns will re-dispatch"
+            )
+            for task in in_flight:
+                task.cancel()
+        else:
+            logger.info("Drained; leaving")
+
+        try:
+            await self._push("phx_leave", {})
+            await ws.close()
+        except Exception as e:
+            logger.debug(f"Error while leaving: {e}")
 
     def _check_join_reply(self, msg):
         """Raise on a failed channel join instead of pretending we're ready.

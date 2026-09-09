@@ -61,6 +61,16 @@ norns.register_port(3000, name="react", url="http://localhost:3000")
 
 A fatally rejected claim (bad token, destroyed gard) raises `JoinError` instead of reconnect-looping; `GardDestroyed` is raised if the gard is destroyed while the worker is connected.
 
+### Shutdown
+
+On SIGTERM or SIGINT the worker drains instead of dying mid-task: it tells Norns to stop sending it work, finishes the tasks it already holds, reports their results, leaves the channel, and `run()` returns. Tasks still running after `shutdown_timeout` seconds (default 30, or `NORNS_SHUTDOWN_TIMEOUT`) are dropped and Norns re-dispatches them. A second signal exits immediately.
+
+```python
+norns.run(agent, shutdown_timeout=60)
+```
+
+`norns.shutdown()` requests the same drain from code — a tool handler or another thread can call it. New work that arrives while a worker drains queues until its replacement connects, so a connector restarted by a supervisor loses nothing.
+
 ## Client
 
 ```python

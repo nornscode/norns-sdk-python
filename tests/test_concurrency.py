@@ -11,45 +11,7 @@ import json
 from norns import Agent, Norns, tool
 from norns.client import websockets  # patched below
 
-
-class FakeWS:
-    """Stands in for a websockets connection: async context manager,
-    async iterator of queued incoming frames, captures sent frames."""
-
-    def __init__(self):
-        self.incoming = asyncio.Queue()
-        self.results = asyncio.Queue()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def send(self, raw):
-        msg = json.loads(raw)
-        if msg[3] == "tool_result":
-            self.results.put_nowait(msg[4])
-
-    async def recv(self):
-        # The join reply.
-        return json.dumps([None, "1", "worker:lobby", "phx_reply", {"status": "ok", "response": {}}])
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        frame = await self.incoming.get()
-        if frame is None:
-            raise StopAsyncIteration
-        return frame
-
-
-def tool_task(task_id, tool_name, **input_data):
-    return json.dumps(
-        [None, "1", "worker:lobby", "tool_task",
-         {"task_id": task_id, "tool_name": tool_name, "input": input_data}]
-    )
+from tests.fakes import FakeWS, tool_task
 
 
 def test_slow_tool_does_not_block_other_tasks(monkeypatch):

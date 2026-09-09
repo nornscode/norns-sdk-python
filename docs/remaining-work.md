@@ -8,6 +8,7 @@
 - `llm_task` handling (calls Anthropic API)
 - `tool_task` handling (calls local tool functions, sync + async)
 - Heartbeat, auto-reconnect
+- Graceful shutdown: SIGTERM/SIGINT or `shutdown()` drains (Norns `drain` event), finishes in-flight tasks up to a deadline, leaves
 - `@tool` decorator with JSON Schema inference from type hints
 - `Agent` dataclass with all AgentDef fields
 
@@ -49,10 +50,6 @@ The worker sends agents in the join payload but doesn't check if the server acce
 **5. Worker: rate limit handling** — MINOR
 
 When the Anthropic API returns 429, the worker returns the error to the orchestrator. But the worker could handle retries locally (with backoff) instead of pushing the problem back to the orchestrator. This would make the rate limit invisible to Norns.
-
-**6. Worker: graceful shutdown** — MINOR
-
-`norns.run()` blocks forever with no way to stop cleanly. Should handle SIGINT/SIGTERM, finish in-progress tasks, then disconnect.
 
 **7. Pydantic support for tool schemas** — NICE TO HAVE
 
