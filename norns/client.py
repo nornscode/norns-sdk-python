@@ -190,6 +190,7 @@ class Norns:
                 "context_strategy": agent.context_strategy,
                 "context_window": agent.context_window,
                 "on_failure": agent.on_failure,
+                "context_policy": agent.context_policy,
             },
         }
 
@@ -499,13 +500,14 @@ class Norns:
                 model = f"{self._llm_provider}/{raw_model}"
             else:
                 model = raw_model
+            if task.get("purpose") == "compact":
+                return await self._handle_compaction_task(task, model)
+
             # Core sends the def's prompt verbatim and never writes prose for
             # the model: the worker composes the prompt, renders kinded
             # messages, elides old tool results, and decides the final output.
             system_prompt = _compose_system_prompt(task)
-            messages = _elide_old_tool_results(
-                [_render_message(m) for m in task.get("messages", [])]
-            )
+            messages = _messages_for_task(task)
             tools = task.get("tools", [])
 
             # Prepend system prompt as a system message
@@ -530,6 +532,29 @@ class Norns:
         except Exception as e:
             logger.error(f"LLM error: {e}")
             return {"status": "error", "error": str(e)}
+
+    async def _handle_compaction_task(self, task: dict, model: str) -> dict:
+        """Fold the history core sent into a summary it will carry forward.
+
+        Core never reads the messages or the summary; this worker writes
+        the prose and returns it as content.
+        """
+        llm_messages: list[dict] = []
+        system_prompt = _compose_compaction_prompt(task)
+        if system_prompt:
+            llm_messages.append({"role": "system", "content": system_prompt})
+        llm_messages.extend(_to_litellm_messages(_compaction_messages(task)))
+
+        response = await asyncio.to_thread(
+            litellm.completion, model=model, max_tokens=4096, messages=llm_messages
+        )
+        result = _from_litellm_response(response)
+        return {
+            "status": "ok",
+            "content": result.get("content", ""),
+            "finish_reason": "stop",
+            "usage": result.get("usage", {}),
+        }
 
     async def _handle_tool_task(self, task: dict, tools: dict[str, ToolDef]) -> dict:
         """Execute a tool call."""
@@ -956,6 +981,41 @@ def _render_kind(kind: str, data: dict, content) -> str:
     if content in (None, ""):
         return _encode(data)
     return _encode(content)
+
+
+COMPACTION_INSTRUCTION = (
+    "Write a summary of the conversation so far for your own future reference. "
+    "You will continue the same task with only this summary and the most recent "
+    "messages, so keep every fact you would need: the task and its constraints, "
+    "decisions made and why, files and identifiers touched, what was tried and "
+    "failed, what remains to be done, and anything the user asked for that is not "
+    "finished. Fold in the earlier summary if there is one. Write prose or terse "
+    "notes, no preamble, no commentary about summarising."
+)
+
+
+def _compose_compaction_prompt(task: dict) -> str:
+    """The def's prompt (so the summary is written from the agent's point of
+    view) plus the earlier summary, for a purpose="compact" task."""
+    prompt = task.get("system_prompt") or ""
+    summary = task.get("summary")
+    if isinstance(summary, str) and summary:
+        prompt += "\n\nSummary of earlier conversation: " + summary
+    return prompt
+
+
+def _compaction_messages(task: dict) -> list[dict]:
+    """The folded history, rendered, then the instruction."""
+    rendered = [_render_message(m) for m in task.get("messages", [])]
+    return rendered + [{"role": "user", "content": COMPACTION_INSTRUCTION}]
+
+
+def _messages_for_task(task: dict) -> list[dict]:
+    """Rendered messages, elided unless core manages the context itself."""
+    rendered = [_render_message(m) for m in task.get("messages", [])]
+    if task.get("context_policy"):
+        return rendered
+    return _elide_old_tool_results(rendered)
 
 
 def _elide_old_tool_results(messages: list[dict]) -> list[dict]:

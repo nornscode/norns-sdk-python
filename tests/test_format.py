@@ -249,3 +249,47 @@ def test_handle_llm_task_composes_renders_and_reports_final_output(monkeypatch):
     assert captured["messages"][-1]["content"] == "Timer completed."
     assert result["status"] == "ok"
     assert result["final_output"] == "Waiting."
+
+
+def test_compaction_prompt_and_messages():
+    from norns.client import COMPACTION_INSTRUCTION, _compaction_messages, _compose_compaction_prompt
+
+    task = {
+        "purpose": "compact",
+        "system_prompt": "You are Sleipnir.",
+        "summary": "Earlier: fixed add().",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "tool", "tool_call_id": "c1", "name": "wait", "kind": "timer_completed", "data": {}, "content": ""},
+        ],
+    }
+    assert _compose_compaction_prompt(task) == "You are Sleipnir.\n\nSummary of earlier conversation: Earlier: fixed add()."
+    assert _compose_compaction_prompt({"system_prompt": "p"}) == "p"
+
+    messages = _compaction_messages(task)
+    assert messages[-1] == {"role": "user", "content": COMPACTION_INSTRUCTION}
+    assert messages[1]["content"] == "Timer completed."
+    assert "kind" not in messages[1]
+
+
+def test_elision_skipped_when_core_manages_context():
+    from norns.client import TOOL_RESULT_CAP, _messages_for_task
+
+    big = "x" * (TOOL_RESULT_CAP + 50)
+    messages = [
+        {"role": "user", "content": "a"},
+        {"role": "tool", "tool_call_id": "c1", "name": "t", "content": big},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+        {"role": "assistant", "content": "d"},
+    ]
+    assert len(_messages_for_task({"messages": messages})[1]["content"]) < len(big)
+    assert _messages_for_task({"messages": messages, "context_policy": {"compact_at": 1, "keep": 1}})[1]["content"] == big
+
+
+def test_agent_registers_context_policy():
+    from norns.agent import Agent
+
+    agent = Agent(name="a", context_policy={"compact_at": 100_000, "keep": 30}, context_strategy="none")
+    assert agent.to_registration()["context_policy"] == {"compact_at": 100_000, "keep": 30}
+    assert Agent(name="b").to_registration()["context_policy"] is None

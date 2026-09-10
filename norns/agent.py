@@ -146,6 +146,10 @@ class Agent:
     context_window: int = 20
     max_steps: int = 50
     on_failure: str = "retry_last_step"
+    # {"compact_at": input_tokens, "keep": messages}: fold older history into
+    # a summary once a response reports compact_at tokens. Pair it with
+    # context_strategy="none"; the summarisation is served by this worker.
+    context_policy: dict | None = None
 
     def to_registration(self) -> dict:
         """Convert to the wire format for worker registration."""
@@ -159,5 +163,6 @@ class Agent:
             "context_window": self.context_window,
             "max_steps": self.max_steps,
             "on_failure": self.on_failure,
+            "context_policy": self.context_policy,
             "tools": [t.name for t in self.tools],
         }
