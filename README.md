@@ -162,8 +162,16 @@ agent = Agent(
     context_window=20,
     max_steps=50,
     on_failure="retry_last_step",    # "stop" or "retry_last_step"
+    max_tokens=8192,                 # ceiling on one response
 )
 ```
+
+`max_tokens` is the ceiling on a single response, not on the history.
+Leave it unset and the worker uses 8192; raise it for an agent whose
+turns are long, such as one writing a whole file in a single turn. A
+turn that reaches the ceiling comes back truncated — the run completes,
+and the `llm_response` event carries `finish_reason: "length"` so a
+client can say so.
 
 ## Docs
 
