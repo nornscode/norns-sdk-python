@@ -315,3 +315,16 @@ def test_error_handling_500(client):
     )
     with pytest.raises(httpx.HTTPStatusError):
         client.list_agents()
+
+
+def test_max_tokens_comes_from_the_task_or_falls_back():
+    """A turn that reaches the ceiling comes back cut off, so the agent's
+    own ceiling has to reach the worker."""
+    from norns.client import DEFAULT_MAX_TOKENS, _max_tokens
+
+    assert _max_tokens({"max_tokens": 32000}) == 32000
+    assert _max_tokens({}) == DEFAULT_MAX_TOKENS
+    assert _max_tokens({"max_tokens": None}) == DEFAULT_MAX_TOKENS
+    assert _max_tokens({"max_tokens": 0}) == DEFAULT_MAX_TOKENS
+    assert _max_tokens({"max_tokens": "lots"}) == DEFAULT_MAX_TOKENS
+    assert DEFAULT_MAX_TOKENS > 4096

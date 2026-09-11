@@ -191,6 +191,7 @@ class Norns:
                 "context_window": agent.context_window,
                 "on_failure": agent.on_failure,
                 "context_policy": agent.context_policy,
+                "max_tokens": agent.max_tokens,
             },
         }
 
@@ -518,7 +519,7 @@ class Norns:
 
             kwargs: dict[str, Any] = {
                 "model": model,
-                "max_tokens": 4096,
+                "max_tokens": _max_tokens(task),
                 "messages": llm_messages,
             }
             if tools:
@@ -546,7 +547,7 @@ class Norns:
         llm_messages.extend(_to_litellm_messages(_compaction_messages(task)))
 
         response = await asyncio.to_thread(
-            litellm.completion, model=model, max_tokens=4096, messages=llm_messages
+            litellm.completion, model=model, max_tokens=_max_tokens(task), messages=llm_messages
         )
         result = _from_litellm_response(response)
         return {
@@ -1008,6 +1009,18 @@ def _compaction_messages(task: dict) -> list[dict]:
     """The folded history, rendered, then the instruction."""
     rendered = [_render_message(m) for m in task.get("messages", [])]
     return rendered + [{"role": "user", "content": COMPACTION_INSTRUCTION}]
+
+
+# One response's ceiling when the agent does not set one. Higher than a
+# provider's own floor because a coding agent writes files in a single
+# turn, and a turn that reaches the ceiling comes back cut off.
+DEFAULT_MAX_TOKENS = 8192
+
+
+def _max_tokens(task: dict) -> int:
+    """The agent's cap, from the task envelope, or ours."""
+    value = task.get("max_tokens")
+    return value if isinstance(value, int) and value > 0 else DEFAULT_MAX_TOKENS
 
 
 def _messages_for_task(task: dict) -> list[dict]:

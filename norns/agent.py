@@ -150,6 +150,10 @@ class Agent:
     # a summary once a response reports compact_at tokens. Pair it with
     # context_strategy="none"; the summarisation is served by this worker.
     context_policy: dict | None = None
+    # The cap on one response. None leaves it to the worker's default;
+    # raise it for agents whose turns are long, such as a coding harness
+    # writing a whole file in one go.
+    max_tokens: int | None = None
 
     def to_registration(self) -> dict:
         """Convert to the wire format for worker registration."""
