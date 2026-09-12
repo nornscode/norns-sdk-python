@@ -21,6 +21,11 @@ NORNS_URL = os.environ.get("NORNS_URL")
 NORNS_API_KEY = os.environ.get("NORNS_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
+# The SDK's own default, so these cannot drift onto a model the provider
+# has retired — which is what happened to the version this replaced. Set
+# NORNS_TEST_MODEL to run them against another one.
+MODEL = os.environ.get("NORNS_TEST_MODEL") or Agent.model
+
 pytestmark = pytest.mark.skipif(
     not NORNS_URL or not NORNS_API_KEY,
     reason="NORNS_URL and NORNS_API_KEY not set",
@@ -42,7 +47,7 @@ def _create_agent(name: str) -> Agent:
     """Create an agent definition and ensure it exists on the server."""
     agent = Agent(
         name=name,
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         system_prompt="You are a test agent. Reply concisely.",
     )
     worker = Norns(NORNS_URL, api_key=NORNS_API_KEY)
@@ -80,7 +85,7 @@ def test_send_message_and_complete(client):
 
     agent_def = Agent(
         name=name,
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         system_prompt="You are a test agent. Use the echo tool with the user's exact message, then reply with what it returned.",
         tools=[echo],
     )

@@ -39,9 +39,9 @@ def test_auth_header(client):
 def test_list_agents(client):
     respx.get(f"{BASE_URL}/api/v1/agents").mock(
         return_value=httpx.Response(200, json={"data": [
-            {"id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-4-20250514",
+            {"id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-5",
              "mode": "task", "system_prompt": "You help.", "max_steps": 50},
-            {"id": 2, "name": "bot-2", "status": "active", "model": "claude-sonnet-4-20250514",
+            {"id": 2, "name": "bot-2", "status": "active", "model": "claude-sonnet-5",
              "mode": "conversation", "system_prompt": "", "max_steps": 100},
         ]})
     )
@@ -56,7 +56,7 @@ def test_list_agents(client):
 def test_get_agent_by_id(client):
     respx.get(f"{BASE_URL}/api/v1/agents/1").mock(
         return_value=httpx.Response(200, json={"data": {
-            "id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-4-20250514",
+            "id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-5",
             "mode": "task", "system_prompt": "You help.", "max_steps": 50,
         }})
     )
@@ -69,9 +69,9 @@ def test_get_agent_by_id(client):
 def test_get_agent_by_name(client):
     respx.get(f"{BASE_URL}/api/v1/agents").mock(
         return_value=httpx.Response(200, json={"data": [
-            {"id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-4-20250514",
+            {"id": 1, "name": "bot-1", "status": "active", "model": "claude-sonnet-5",
              "mode": "task", "system_prompt": "", "max_steps": 50},
-            {"id": 2, "name": "support-bot", "status": "active", "model": "claude-sonnet-4-20250514",
+            {"id": 2, "name": "support-bot", "status": "active", "model": "claude-sonnet-5",
              "mode": "conversation", "system_prompt": "", "max_steps": 50},
         ]})
     )
