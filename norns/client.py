@@ -9,6 +9,7 @@ import os
 import signal
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Generator
 from typing import Any
 
@@ -26,6 +27,8 @@ from norns.models import (
     StreamEvent,
     WaitingFor,
 )
+
+MAX_REMEMBERED_RESULTS = 512
 
 logger = logging.getLogger("norns")
 
@@ -68,6 +71,11 @@ class Norns:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown: asyncio.Event | None = None
         self._shutdown_timeout = 30.0
+        # Results of side-effecting calls, by the idempotency key core issued.
+        # Bounded: a worker lives for days and this is a crash guard, not a
+        # cache, so the oldest entries are the ones least likely to be asked
+        # for again.
+        self._completed: OrderedDict[str, dict] = OrderedDict()
 
     def run(
         self,
@@ -558,9 +566,22 @@ class Norns:
         }
 
     async def _handle_tool_task(self, task: dict, tools: dict[str, ToolDef]) -> dict:
-        """Execute a tool call."""
+        """Execute a tool call, unless we already did this exact one.
+
+        A key on the task means core considers the call side-effecting and
+        has named it: same run, same step, same tool call, same key, however
+        many times it is dispatched. Core cannot know whether the effect
+        landed — if the result never reached it, it re-dispatches — so this
+        worker is the only party that can answer, and it answers from what
+        it kept rather than doing the thing twice.
+        """
         tool_name = task.get("tool_name", task.get("name", ""))
         input_data = task.get("input", {})
+        key = task.get("idempotency_key")
+
+        if key and key in self._completed:
+            logger.info(f"Tool {tool_name}: already done ({key}), reusing the result")
+            return dict(self._completed[key])
 
         tool = tools.get(tool_name)
         if tool is None:
@@ -573,11 +594,23 @@ class Norns:
             else:
                 result = await asyncio.to_thread(tool.handler, **input_data)
 
-            return {"status": "ok", "result": str(result)}
+            return self._remember(key, {"status": "ok", "result": str(result)})
 
         except Exception as e:
             logger.error(f"Tool {tool_name} failed: {e}")
+            # Failures are not remembered: a retry of something that did not
+            # happen should happen.
             return {"status": "error", "error": str(e)}
+
+    def _remember(self, key: str | None, result: dict) -> dict:
+        if not key:
+            return result
+
+        self._completed[key] = dict(result, duplicate=True)
+        while len(self._completed) > MAX_REMEMBERED_RESULTS:
+            self._completed.popitem(last=False)
+
+        return result
 
     async def _send_result(self, ws, task: dict, result: dict):
         """Send a task result back to the orchestrator."""

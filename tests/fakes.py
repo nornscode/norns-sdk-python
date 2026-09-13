@@ -49,8 +49,8 @@ class FakeWS:
         return frame
 
 
-def tool_task(task_id, tool_name, **input_data):
-    return json.dumps(
-        [None, "1", "worker:lobby", "tool_task",
-         {"task_id": task_id, "tool_name": tool_name, "input": input_data}]
-    )
+def tool_task(task_id, tool_name, idempotency_key=None, **input_data):
+    payload = {"task_id": task_id, "tool_name": tool_name, "input": input_data}
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    return json.dumps([None, "1", "worker:lobby", "tool_task", payload])

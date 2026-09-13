@@ -128,7 +128,8 @@ def lookup_customer(email: str) -> str:
     return f"Found: {customer['name']} ({customer['plan']})"
 ```
 
-Mark side-effecting tools so Norns can enforce idempotency on replay:
+Mark side-effecting tools so a call that is dispatched twice only happens
+once:
 
 ```python
 @tool(side_effect=True)
@@ -137,6 +138,16 @@ def charge_card(customer_id: str, amount: float) -> str:
     result = stripe.charges.create(customer=customer_id, amount=int(amount * 100))
     return f"Charged ${amount}: {result['id']}"
 ```
+
+Norns names every side-effecting call with a key derived from the run, the
+step and the tool call id, and re-dispatches the call if the result never
+reached it — after a crash it has no way to know whether the charge went
+through. The worker does: it keeps the result against the key and answers
+the second dispatch from that, flagging it so the run's log records a
+`tool_duplicate` rather than what looks like a second charge. The memory is
+in-process and bounded, so it covers the orchestrator restarting, not the
+worker itself dying — for that, pass the key on to a provider that dedupes
+(most payment APIs take an idempotency key of their own).
 
 Async handlers work too:
 
