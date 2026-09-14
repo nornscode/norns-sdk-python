@@ -8,9 +8,12 @@ import logging
 import os
 import signal
 import time
+import re
+import tempfile
 import uuid
 from collections import OrderedDict
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -30,6 +33,82 @@ from norns.models import (
 
 MAX_REMEMBERED_RESULTS = 512
 
+
+class _CompletedCalls:
+    """What this worker has already done, by idempotency key.
+
+    Kept on disk, because the case it exists for is the worker dying: core
+    re-dispatches the call it was holding, and a worker that came back with
+    an empty head would do the side effect a second time — which is the exact
+    thing the key is supposed to prevent.
+
+    It is a crash guard, not a ledger. Bounded, best-effort, and never allowed
+    to take a worker down: if the file cannot be read or written, the worker
+    runs with memory alone and says so once.
+    """
+
+    def __init__(self, path: Path | None, limit: int = MAX_REMEMBERED_RESULTS):
+        self.path = path
+        self.limit = limit
+        self._entries: OrderedDict[str, dict] = OrderedDict()
+        self._load()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._entries
+
+    def __getitem__(self, key: str) -> dict:
+        return dict(self._entries[key])
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def add(self, key: str, result: dict) -> None:
+        self._entries[key] = result
+        while len(self._entries) > self.limit:
+            self._entries.popitem(last=False)
+        self._save()
+
+    def _load(self) -> None:
+        if not self.path:
+            return
+        try:
+            with open(self.path) as f:
+                for key, result in json.load(f).items():
+                    self._entries[key] = result
+            logger.debug(f"Loaded {len(self._entries)} completed call(s) from {self.path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Could not read {self.path} ({e}); starting with no memory of completed calls")
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(self._entries, f)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            logger.warning(f"Could not write {self.path} ({e}); completed calls will not survive a restart")
+            self.path = None
+
+
+def _completed_calls_path(worker_id: str) -> Path | None:
+    """Where a worker keeps what it has already done.
+
+    `NORNS_STATE_DIR` if set, else a per-user directory under the system temp
+    dir — enough to outlive the process, which is the failure this guards, and
+    nothing a project has to clean up.
+    """
+    base = os.environ.get("NORNS_STATE_DIR")
+    if base == "":
+        return None
+    root = Path(base) if base else Path(tempfile.gettempdir()) / "norns-worker-state"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", worker_id)[:120]
+    return root / f"{safe}.completed.json"
+
 logger = logging.getLogger("norns")
 
 
@@ -45,6 +124,49 @@ class JoinRetryable(Exception):
 
 class GardDestroyed(Exception):
     """The gard this worker claimed was destroyed while it was connected."""
+
+
+def _agent_list(agents: Agent | list[Agent] | tuple[Agent, ...]) -> list[Agent]:
+    """One agent or several, as a list. Names must be unique: the second
+    would overwrite the first on the server."""
+    items = [agents] if isinstance(agents, Agent) else list(agents)
+    if not items:
+        raise ValueError("A worker needs at least one Agent")
+    names = [a.name for a in items]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"Agent names must be unique on one worker: {dupes}")
+    return items
+
+
+def _tools_by_name(agents: list[Agent]) -> dict[str, ToolDef]:
+    """Every agent's tools, one per name. A tool_task names only the tool,
+    so two different tools under one name can't both be served."""
+    tools: dict[str, ToolDef] = {}
+    owners: dict[str, str] = {}
+    for agent in agents:
+        for t in agent.tools:
+            existing = tools.setdefault(t.name, t)
+            owners.setdefault(t.name, agent.name)
+            if existing != t:
+                raise ValueError(
+                    f"Agents '{owners[t.name]}' and '{agent.name}' have different tools "
+                    f"named '{t.name}'; tools are dispatched by name, so share one ToolDef or rename one"
+                )
+    return tools
+
+
+def _llm_provider(agents: list[Agent]) -> str:
+    """The provider for model names without a "provider/" prefix. An
+    llm_task carries the model, not the agent's llm_provider, so every agent
+    relying on llm_provider must agree; prefix the model to mix providers."""
+    providers = {a.llm_provider for a in agents if "/" not in a.model}
+    if len(providers) > 1:
+        raise ValueError(
+            f"Agents on one worker disagree on llm_provider ({sorted(providers)}); "
+            'give their models a provider prefix instead, e.g. "openai/gpt-4o"'
+        )
+    return providers.pop() if providers else agents[0].llm_provider
 
 
 class Norns:
@@ -71,15 +193,13 @@ class Norns:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown: asyncio.Event | None = None
         self._shutdown_timeout = 30.0
-        # Results of side-effecting calls, by the idempotency key core issued.
-        # Bounded: a worker lives for days and this is a crash guard, not a
-        # cache, so the oldest entries are the ones least likely to be asked
-        # for again.
-        self._completed: OrderedDict[str, dict] = OrderedDict()
+        # What this worker has already done, by the idempotency key core
+        # issued. Opened once the worker id is known (see _connect_and_serve).
+        self._completed = _CompletedCalls(None)
 
     def run(
         self,
-        agent: Agent,
+        agent: Agent | list[Agent] | tuple[Agent, ...],
         *,
         llm_api_key: str | None = None,
         worker_id: str | None = None,
@@ -92,6 +212,12 @@ class Norns:
 
         Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
+
+        Pass a list of agents to serve several from one process. Each is
+        created or updated, and the worker registers the union of their
+        tools. Tools are dispatched by name, so two different tools with the
+        same name raise here, before connecting. Agents whose model has no
+        "provider/" prefix must share one llm_provider.
 
         On SIGTERM or SIGINT (or `shutdown()`) the worker drains: it tells
         Norns to stop sending it work, finishes the tasks it already holds
@@ -114,7 +240,12 @@ class Norns:
         logging.getLogger("litellm").setLevel(logging.WARNING)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
-        self._ensure_agent(agent)
+        agents = _agent_list(agent)
+        # A bad combination fails before anything reaches the server.
+        _tools_by_name(agents)
+        _llm_provider(agents)
+        for a in agents:
+            self._ensure_agent(a)
         # NORNS_GARD / NORNS_GARD_CLAIM_TOKEN mirror NORNS_WORKER_ID below:
         # a provisioner (volund) hands the worker its gard through the
         # environment so scaffolded workers need no code changes.
@@ -135,7 +266,7 @@ class Norns:
         self._shutdown_timeout = shutdown_timeout
 
         try:
-            asyncio.run(self._run_loop(agent, wid))
+            asyncio.run(self._run_loop(agents, wid))
         except KeyboardInterrupt:
             # Only reachable where signal handlers can't be installed
             # (Windows, non-main thread): there is no drain, just exit.
@@ -186,21 +317,30 @@ class Norns:
         This ensures code changes (system_prompt, model, etc.) are always picked up.
         """
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        model_config = {
+            "mode": agent.mode,
+            "checkpoint_policy": agent.checkpoint_policy,
+            "context_strategy": agent.context_strategy,
+            "context_window": agent.context_window,
+            "on_failure": agent.on_failure,
+            "context_policy": agent.context_policy,
+            "max_tokens": agent.max_tokens,
+        }
+        # Policies are only sent when set. The update replaces model_config
+        # whole, so dropping one from the Agent drops it on the server too.
+        if agent.allowed_tools is not None:
+            model_config["tools"] = {"mode": "allowlist", "allowed_tools": list(agent.allowed_tools)}
+        if agent.subagents is not None:
+            model_config["subagents"] = agent.subagents
+        if agent.subagent_conversation is not None:
+            model_config["subagent_conversation"] = agent.subagent_conversation
         body = {
             "name": agent.name,
             "system_prompt": agent.system_prompt,
             "status": "idle",
             "model": agent.model,
             "max_steps": agent.max_steps,
-            "model_config": {
-                "mode": agent.mode,
-                "checkpoint_policy": agent.checkpoint_policy,
-                "context_strategy": agent.context_strategy,
-                "context_window": agent.context_window,
-                "on_failure": agent.on_failure,
-                "context_policy": agent.context_policy,
-                "max_tokens": agent.max_tokens,
-            },
+            "model_config": model_config,
         }
 
         with httpx.Client(base_url=self.url, headers=headers) as client:
@@ -220,11 +360,12 @@ class Norns:
             created = resp.json()["data"]
             logger.info(f"Created agent '{agent.name}' (id={created['id']})")
 
-    async def _run_loop(self, agent: Agent, worker_id: str):
+    async def _run_loop(self, agents: Agent | list[Agent], worker_id: str):
         """Main event loop: connect, register, handle tasks, reconnect on
         failure, until shutdown is requested."""
-        tools_by_name = {t.name: t for t in agent.tools}
-        self._llm_provider = agent.llm_provider
+        agents = _agent_list(agents)
+        tools_by_name = _tools_by_name(agents)
+        self._llm_provider = _llm_provider(agents)
         self._loop = asyncio.get_running_loop()
         self._shutdown = asyncio.Event()
         installed = self._install_signal_handlers()
@@ -232,7 +373,7 @@ class Norns:
         try:
             while not self._shutdown.is_set():
                 try:
-                    await self._connect_and_serve(agent, worker_id, tools_by_name)
+                    await self._connect_and_serve(agents, worker_id, tools_by_name)
                 except (JoinError, GardDestroyed):
                     # Retrying can never succeed — surface it instead of spinning.
                     raise
@@ -289,12 +430,15 @@ class Norns:
         except asyncio.TimeoutError:
             pass
 
-    def _join_payload(self, agent: Agent, worker_id: str) -> dict:
+    def _join_payload(self, agents: Agent | list[Agent], worker_id: str) -> dict:
+        # The server reads only the tools from here; agent definitions,
+        # policies included, reach it through _ensure_agent.
+        agents = _agent_list(agents)
         payload = {
             "worker_id": worker_id,
-            "tools": [t.to_registration() for t in agent.tools],
+            "tools": [t.to_registration() for t in _tools_by_name(agents).values()],
             "capabilities": ["llm", "tools"],
-            "agents": [agent.to_registration()],
+            "agents": [a.to_registration() for a in agents],
         }
 
         if self._gard is not None:
@@ -305,11 +449,17 @@ class Norns:
 
     async def _connect_and_serve(
         self,
-        agent: Agent,
+        agents: Agent | list[Agent],
         worker_id: str,
         tools_by_name: dict[str, ToolDef],
     ):
         """Single connection lifecycle: connect, join, handle messages."""
+        # Keyed by worker id: core re-dispatches a lost call to whichever
+        # worker comes back under that identity, and this is what that worker
+        # needs to recognise it.
+        if self._completed.path is None and not self._completed:
+            self._completed = _CompletedCalls(_completed_calls_path(worker_id))
+
         ws_url = f"{self._ws_url}/worker/websocket?token={self.api_key}&vsn=2.0.0"
 
         async with websockets.connect(ws_url) as ws:
@@ -318,7 +468,7 @@ class Norns:
 
             # Phoenix channel join
             join_msg = json.dumps(
-                [None, "1", "worker:lobby", "phx_join", self._join_payload(agent, worker_id)]
+                [None, "1", "worker:lobby", "phx_join", self._join_payload(agents, worker_id)]
             )
             await ws.send(join_msg)
 
@@ -603,13 +753,8 @@ class Norns:
             return {"status": "error", "error": str(e)}
 
     def _remember(self, key: str | None, result: dict) -> dict:
-        if not key:
-            return result
-
-        self._completed[key] = dict(result, duplicate=True)
-        while len(self._completed) > MAX_REMEMBERED_RESULTS:
-            self._completed.popitem(last=False)
-
+        if key:
+            self._completed.add(key, dict(result, duplicate=True))
         return result
 
     async def _send_result(self, ws, task: dict, result: dict):
@@ -1004,6 +1149,11 @@ def _render_kind(kind: str, data: dict, content) -> str:
         return "Cannot launch self as a sub-agent"
     if kind == "subagent_missing":
         return f"Sub-agent run {data.get('run_id')} no longer exists, so its result cannot be recovered."
+    if kind == "subagent_busy":
+        return (
+            f"Agent '{data.get('agent_name')}' is still working on an earlier task for this "
+            "conversation. Wait for its result before giving it another."
+        )
     if kind == "subagent_launch_failed":
         return f"Failed to launch agent '{data.get('agent_name')}': {data.get('reason')}"
     if kind == "subagent_completed":

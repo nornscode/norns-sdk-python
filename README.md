@@ -43,7 +43,7 @@ norns = Norns("http://localhost:4000", api_key=os.environ["NORNS_API_KEY"])
 norns.run(agent)  # LLM API keys read from env (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
 ```
 
-`norns.run()` connects via WebSocket, registers the agent and tools, then blocks forever handling `llm_task` and `tool_task` dispatches. LLM calls go through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
+`norns.run()` connects via WebSocket, registers the agent (or a list of agents — see [Several agents, one worker](#several-agents-one-worker)) and tools, then blocks forever handling `llm_task` and `tool_task` dispatches. LLM calls go through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
 
 ### Gards
 
@@ -174,6 +174,8 @@ agent = Agent(
     max_steps=50,
     on_failure="retry_last_step",    # "stop" or "retry_last_step"
     max_tokens=8192,                 # ceiling on one response
+    allowed_tools=["search"],        # offer only these of its tools (default: every tool)
+    subagents={"mode": "disabled"},  # launch_agent / list_agents policy (default: open)
 )
 ```
 
@@ -183,6 +185,46 @@ turns are long, such as one writing a whole file in a single turn. A
 turn that reaches the ceiling comes back truncated — the run completes,
 and the `llm_response` event carries `finish_reason: "length"` so a
 client can say so.
+
+### Several agents, one worker
+
+`run()` also takes a list. Every agent is created or updated, and the
+worker registers the union of their tools. A tool call is dispatched by
+name, so two *different* tools sharing a name raise before the worker
+connects; the same tool in several agents is fine.
+
+```python
+lead = Agent(
+    name="lead",
+    tools=[read_file, write_file],
+    subagents={"mode": "allowlist", "allowed_agents": ["explore"], "max_depth": 1},
+)
+explore = Agent(
+    name="explore",
+    tools=[read_file],
+    allowed_tools=["read_file"],
+    subagents={"mode": "disabled"},
+    subagent_conversation="per_launch",
+)
+norns.run([lead, explore])
+```
+
+An agent's `tools` are what the worker serves, not what the agent is
+offered: Norns offers every tool registered in the tenant unless
+`allowed_tools` narrows it, so set it on any agent that should see less.
+Naming a tool that isn't in `tools` raises. The built-ins (`ask_human`,
+`wait`, `launch_agent`, `list_agents`) are never filtered.
+
+`subagents` governs the last two: `mode` is `"open"`, `"allowlist"` (with
+`allowed_agents`) or `"disabled"`; `allow_list_agents` permits
+`list_agents`; `max_depth` bounds nesting. `subagent_conversation` applies
+when the agent is launched by another: `"per_launch"` starts a fresh
+conversation each time, `"per_parent"` keeps one per parent conversation —
+a launch while the previous one is still working tells the parent to wait.
+
+LLM tasks carry the model name, not the agent, so agents whose `model` has
+no `provider/` prefix must share one `llm_provider`. Prefix the model
+(`"openai/gpt-4o"`) to mix providers.
 
 ## Docs
 

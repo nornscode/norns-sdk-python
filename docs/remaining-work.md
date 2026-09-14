@@ -11,6 +11,8 @@
 - Graceful shutdown: SIGTERM/SIGINT or `shutdown()` drains (Norns `drain` event), finishes in-flight tasks up to a deadline, leaves
 - `@tool` decorator with JSON Schema inference from type hints
 - `Agent` dataclass with all AgentDef fields
+- Several agents per worker: `norns.run([agent1, agent2])` registers the union of their tools
+- Per-agent tool allowlist (`allowed_tools`), sub-agent policy (`subagents`), `subagent_conversation`
 
 ### Client (`NornsClient` class) ✓
 - HTTP client with auth (`httpx`)
@@ -54,10 +56,6 @@ When the Anthropic API returns 429, the worker returns the error to the orchestr
 **7. Pydantic support for tool schemas** — NICE TO HAVE
 
 Currently schemas are inferred from type hints only. If a user passes a Pydantic model as a type hint, the SDK should use `model.model_json_schema()` to generate the schema. Check if Pydantic is installed and use it opportunistically.
-
-**8. Multiple agents per worker** — NICE TO HAVE
-
-Currently `norns.run(agent)` takes one agent. Should support `norns.run([agent1, agent2])` for workers that handle multiple agent types.
 
 ### Documentation
 

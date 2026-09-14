@@ -9,10 +9,20 @@ did, and answers the second dispatch from that.
 
 import asyncio
 
+import pytest
+
 from norns import Agent, Norns, tool
 from norns.client import MAX_REMEMBERED_RESULTS, websockets  # patched below
 
 from tests.fakes import FakeWS, tool_task
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """Each test gets its own worker state. Real keys carry a run id and are
+    unique for all time; the short keys here would otherwise leak between
+    runs — which is itself the store doing its job."""
+    monkeypatch.setenv("NORNS_STATE_DIR", str(tmp_path / "state"))
 
 
 def charging_agent(charges):
@@ -79,7 +89,7 @@ def test_without_a_key_nothing_is_remembered(monkeypatch):
         # No key means core did not consider this side-effecting. Twice asked
         # is twice meant.
         assert "duplicate" not in second
-        assert norns._completed == {}
+        assert len(norns._completed) == 0
 
     serve(monkeypatch, charging_agent(charges), script)
     assert charges == [10, 10]
@@ -127,3 +137,52 @@ def test_the_memory_is_bounded(monkeypatch):
         assert f"k{MAX_REMEMBERED_RESULTS + 9}" in norns._completed
 
     serve(monkeypatch, charging_agent(charges), script)
+
+
+def test_the_memory_outlives_the_worker(monkeypatch):
+    """The case the key exists for: the worker dies holding the call.
+
+    Core re-dispatches it to whatever comes back under the same worker id, so
+    what that worker remembers has to have survived the process — otherwise it
+    does the side effect a second time, which is the whole thing we are trying
+    not to do.
+    """
+    charges = []
+    agent = charging_agent(charges)
+
+    async def first_life(fake, _norns):
+        fake.incoming.put_nowait(tool_task("t1", "charge_card", idempotency_key="k1", amount=10))
+        await asyncio.wait_for(fake.results.get(), 2)
+
+    serve(monkeypatch, agent, first_life)
+    assert charges == [10]
+
+    async def second_life(fake, norns):
+        # A different process entirely, same worker id, same key.
+        fake.incoming.put_nowait(tool_task("t2", "charge_card", idempotency_key="k1", amount=10))
+        result = await asyncio.wait_for(fake.results.get(), 2)
+        assert result["duplicate"] is True
+        assert result["result"] == "charged 10"
+        assert "k1" in norns._completed
+
+    serve(monkeypatch, agent, second_life)
+    assert charges == [10]
+
+
+def test_an_unwritable_state_dir_does_not_stop_the_worker(monkeypatch, tmp_path):
+    """A crash guard that crashes the worker is worse than no crash guard."""
+    blocked = tmp_path / "nope"
+    blocked.write_text("not a directory")
+    monkeypatch.setenv("NORNS_STATE_DIR", str(blocked))
+
+    charges = []
+
+    async def script(fake, norns):
+        fake.incoming.put_nowait(tool_task("t1", "charge_card", idempotency_key="k1", amount=10))
+        result = await asyncio.wait_for(fake.results.get(), 2)
+        assert result["status"] == "ok"
+        # Still deduplicates in memory for as long as this process lives.
+        assert "k1" in norns._completed
+
+    serve(monkeypatch, charging_agent(charges), script)
+    assert charges == [10]

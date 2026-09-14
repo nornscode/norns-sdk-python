@@ -170,6 +170,9 @@ def test_render_system_results():
         (("subagent_self", {"agent_name": "me"}, ""), "Cannot launch self as a sub-agent"),
         (("subagent_missing", {"run_id": 42}, ""), "Sub-agent run 42 no longer exists, so its result cannot be recovered."),
         (("subagent_launch_failed", {"agent_name": "kid", "reason": ":busy"}, ""), "Failed to launch agent 'kid': :busy"),
+        (("subagent_busy", {"agent_name": "coder"}, ""),
+            "Agent 'coder' is still working on an earlier task for this conversation. "
+            "Wait for its result before giving it another."),
     ]
     for (kind, data, content), expected in cases:
         out = _render_message({**base, "kind": kind, "data": data, "content": content})

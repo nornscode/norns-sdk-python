@@ -154,6 +154,36 @@ class Agent:
     # raise it for agents whose turns are long, such as a coding harness
     # writing a whole file in one go.
     max_tokens: int | None = None
+    # Names from `tools` this agent is offered. None offers every tool
+    # registered in the tenant — including other agents' tools when one
+    # worker serves several. Built-ins (ask_human, wait, launch_agent,
+    # list_agents) are never filtered, so they don't belong here.
+    allowed_tools: list[str] | None = None
+    # Sub-agent policy, sent as-is: {"mode": "open" | "allowlist" |
+    # "disabled", "allowed_agents": [names], "allow_list_agents": bool,
+    # "max_depth": int}. None leaves the server's default (open, depth 3).
+    subagents: dict | None = None
+    # When this agent is launched as a sub-agent: "per_launch" gives every
+    # launch a fresh conversation, "per_parent" reuses one per parent
+    # conversation. None leaves it to the server.
+    subagent_conversation: str | None = None
+
+    def __post_init__(self):
+        if self.subagent_conversation not in (None, *SUBAGENT_CONVERSATIONS):
+            raise ValueError(
+                f"Agent '{self.name}': subagent_conversation must be one of "
+                f"{', '.join(SUBAGENT_CONVERSATIONS)}, got {self.subagent_conversation!r}"
+            )
+        if self.allowed_tools is not None:
+            # A name the worker doesn't provide is always a mistake: the
+            # server would offer nothing for it.
+            known = {t.name for t in self.tools}
+            unknown = [n for n in self.allowed_tools if n not in known]
+            if unknown:
+                raise ValueError(
+                    f"Agent '{self.name}': allowed_tools names {unknown} not in its tools "
+                    f"({sorted(known)}); built-ins are always available and need no entry"
+                )
 
     def to_registration(self) -> dict:
         """Convert to the wire format for worker registration."""
@@ -168,5 +198,11 @@ class Agent:
             "max_steps": self.max_steps,
             "on_failure": self.on_failure,
             "context_policy": self.context_policy,
+            "allowed_tools": self.allowed_tools,
+            "subagents": self.subagents,
+            "subagent_conversation": self.subagent_conversation,
             "tools": [t.name for t in self.tools],
         }
+
+
+SUBAGENT_CONVERSATIONS = ("per_launch", "per_parent")

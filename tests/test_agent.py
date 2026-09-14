@@ -1,5 +1,7 @@
 """Tests for agent definition and tool decorator."""
 
+import pytest
+
 from norns import Agent, tool
 
 
@@ -109,3 +111,30 @@ def test_agent_registration_format():
     assert reg["system_prompt"] == "You are helpful."
     assert reg["mode"] == "conversation"
     assert reg["tools"] == ["search"]
+
+
+def test_agent_policy_fields_default_to_unset():
+    agent = Agent(name="test")
+    assert agent.allowed_tools is None
+    assert agent.subagents is None
+    assert agent.subagent_conversation is None
+
+
+def test_allowed_tools_must_name_the_agents_tools():
+    @tool
+    def search(query: str) -> str:
+        """Search."""
+        return ""
+
+    Agent(name="bot", tools=[search], allowed_tools=["search"])
+    with pytest.raises(ValueError, match="send_email"):
+        Agent(name="bot", tools=[search], allowed_tools=["search", "send_email"])
+    with pytest.raises(ValueError, match="built-ins"):
+        Agent(name="bot", tools=[search], allowed_tools=["ask_human"])
+
+
+def test_subagent_conversation_is_validated():
+    for value in ("per_launch", "per_parent"):
+        assert Agent(name="bot", subagent_conversation=value).subagent_conversation == value
+    with pytest.raises(ValueError, match="per_parent"):
+        Agent(name="bot", subagent_conversation="shared")
