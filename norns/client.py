@@ -709,12 +709,15 @@ class Norns:
             litellm.completion, model=model, max_tokens=_max_tokens(task), messages=llm_messages
         )
         result = _from_litellm_response(response)
-        return {
+        compacted = {
             "status": "ok",
             "content": result.get("content", ""),
             "finish_reason": "stop",
             "usage": result.get("usage", {}),
         }
+        if "model" in result:
+            compacted["model"] = result["model"]
+        return compacted
 
     async def _handle_tool_task(self, task: dict, tools: dict[str, ToolDef]) -> dict:
         """Execute a tool call, unless we already did this exact one.
@@ -1380,11 +1383,15 @@ def _from_litellm_response(response) -> dict:
         "input_tokens": response.usage.prompt_tokens,
         "output_tokens": response.usage.completion_tokens,
     }
-    # input_tokens counts cache reads too; this says how many of them were.
+    # input_tokens counts cache reads and writes too; these say how many of
+    # each, since providers price them differently from plain input.
     details = getattr(response.usage, "prompt_tokens_details", None)
     cached = getattr(details, "cached_tokens", None)
     if isinstance(cached, int):
         usage["cache_read_tokens"] = cached
+    written = getattr(details, "cache_creation_tokens", None)
+    if isinstance(written, int):
+        usage["cache_write_tokens"] = written
 
     result: dict[str, Any] = {
         "status": "ok",
@@ -1392,6 +1399,10 @@ def _from_litellm_response(response) -> dict:
         "finish_reason": finish_reason,
         "usage": usage,
     }
+    # The model that served the call, so core can price it from the event.
+    model = getattr(response, "model", None)
+    if isinstance(model, str) and model:
+        result["model"] = model
     if tool_calls:
         result["tool_calls"] = tool_calls
 
