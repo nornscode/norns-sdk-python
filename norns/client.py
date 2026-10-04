@@ -781,6 +781,19 @@ class Norns:
                 break
 
 
+def _parse_run(data: dict) -> RunResponse:
+    return RunResponse(
+        run_id=data["id"],
+        status=data["status"],
+        output=data.get("output"),
+        agent_id=data["agent_id"],
+        conversation_id=data.get("conversation_id"),
+        trigger_type=data.get("trigger_type", "message"),
+        inserted_at=data["inserted_at"],
+        waiting_for=WaitingFor.from_dict(data.get("waiting_for")),
+    )
+
+
 class NornsClient:
     """Client for interacting with Norns agents.
 
@@ -912,17 +925,33 @@ class NornsClient:
     def get_run(self, run_id: int) -> RunResponse:
         """Get details of a run."""
         resp = self._request("GET", f"/api/v1/runs/{run_id}")
-        data = resp.json()["data"]
-        return RunResponse(
-            run_id=data["id"],
-            status=data["status"],
-            output=data.get("output"),
-            agent_id=data["agent_id"],
-            conversation_id=data.get("conversation_id"),
-            trigger_type=data.get("trigger_type", "message"),
-            inserted_at=data["inserted_at"],
-            waiting_for=WaitingFor.from_dict(data.get("waiting_for")),
-        )
+        return _parse_run(resp.json()["data"])
+
+    def list_runs(
+        self,
+        limit: int = 50,
+        status: str | None = None,
+        agent_id: int | None = None,
+    ) -> list[RunResponse]:
+        """List the tenant's runs, most recent first.
+
+        Use it to find runs nobody is holding a handle to — above all the ones
+        parked on an ``ask_human`` question, which a client that did not start
+        them has no other way to discover:
+
+            for run in client.list_runs(status="waiting"):
+                print(run.run_id, run.waiting_for.question)
+
+        ``status`` and ``agent_id`` filter the page the server returned, so a
+        narrow filter over a busy tenant may need a larger ``limit``.
+        """
+        resp = self._request("GET", "/api/v1/runs", params={"limit": limit})
+        runs = [_parse_run(r) for r in resp.json()["data"]]
+        if status is not None:
+            runs = [r for r in runs if r.status == status]
+        if agent_id is not None:
+            runs = [r for r in runs if r.agent_id == agent_id]
+        return runs
 
     def reply(self, run_id: int, answer: str) -> None:
         """Answer a run parked on an ``ask_human`` question.

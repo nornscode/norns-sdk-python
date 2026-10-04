@@ -328,3 +328,71 @@ def test_max_tokens_comes_from_the_task_or_falls_back():
     assert _max_tokens({"max_tokens": 0}) == DEFAULT_MAX_TOKENS
     assert _max_tokens({"max_tokens": "lots"}) == DEFAULT_MAX_TOKENS
     assert DEFAULT_MAX_TOKENS > 4096
+
+
+# --- Listing runs ---
+
+
+def _run_json(run_id: int, status: str, agent_id: int = 1, waiting_for=None):
+    return {
+        "id": run_id,
+        "agent_id": agent_id,
+        "status": status,
+        "output": None,
+        "conversation_id": None,
+        "trigger_type": "schedule",
+        "inserted_at": "2026-10-03T06:00:00Z",
+        "waiting_for": waiting_for,
+    }
+
+
+@respx.mock
+def test_list_runs(client):
+    respx.get(f"{BASE_URL}/api/v1/runs").mock(
+        return_value=httpx.Response(200, json={"data": [
+            _run_json(3, "running"),
+            _run_json(2, "completed"),
+        ]})
+    )
+    runs = client.list_runs()
+    assert [r.run_id for r in runs] == [3, 2]
+    assert all(isinstance(r, RunResponse) for r in runs)
+
+
+@respx.mock
+def test_list_runs_passes_limit(client):
+    route = respx.get(f"{BASE_URL}/api/v1/runs").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    client.list_runs(limit=200)
+    assert route.calls[0].request.url.params["limit"] == "200"
+
+
+@respx.mock
+def test_list_runs_filters_by_status_and_agent(client):
+    respx.get(f"{BASE_URL}/api/v1/runs").mock(
+        return_value=httpx.Response(200, json={"data": [
+            _run_json(5, "waiting", agent_id=7),
+            _run_json(4, "waiting", agent_id=9),
+            _run_json(3, "running", agent_id=7),
+        ]})
+    )
+    assert [r.run_id for r in client.list_runs(status="waiting")] == [5, 4]
+    assert [r.run_id for r in client.list_runs(agent_id=7)] == [5, 3]
+    assert [r.run_id for r in client.list_runs(status="waiting", agent_id=7)] == [5]
+
+
+@respx.mock
+def test_a_waiting_run_carries_its_question(client):
+    """The reason list_runs exists: finding a parked run you have no handle on."""
+    respx.get(f"{BASE_URL}/api/v1/runs").mock(
+        return_value=httpx.Response(200, json={"data": [
+            _run_json(11, "waiting", waiting_for={
+                "question": "Ship the gard fix, or the in-flight marker?",
+                "tool_call_id": "call_1",
+            }),
+        ]})
+    )
+    [run] = client.list_runs(status="waiting")
+    assert run.is_waiting
+    assert run.waiting_for.question.startswith("Ship the gard fix")
