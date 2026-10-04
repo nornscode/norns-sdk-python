@@ -29,7 +29,8 @@ def test_to_litellm_tools_multiple():
 
 
 def _make_response(content="Hello!", finish_reason="stop", tool_calls=None,
-                   prompt_tokens=100, completion_tokens=20, cached_tokens=None):
+                   prompt_tokens=100, completion_tokens=20, cached_tokens=None,
+                   cache_creation_tokens=None, model=None):
     """Build a mock LiteLLM response."""
     message = MagicMock()
     message.content = content
@@ -43,12 +44,15 @@ def _make_response(content="Hello!", finish_reason="stop", tool_calls=None,
     usage.prompt_tokens = prompt_tokens
     usage.completion_tokens = completion_tokens
     usage.prompt_tokens_details = None
-    if cached_tokens is not None:
-        usage.prompt_tokens_details = MagicMock(cached_tokens=cached_tokens)
+    if cached_tokens is not None or cache_creation_tokens is not None:
+        usage.prompt_tokens_details = MagicMock(
+            cached_tokens=cached_tokens, cache_creation_tokens=cache_creation_tokens
+        )
 
     response = MagicMock()
     response.choices = [choice]
     response.usage = usage
+    response.model = model
     return response
 
 
@@ -97,6 +101,20 @@ def test_from_litellm_reports_cache_reads():
     assert result["usage"] == {"input_tokens": 40_000, "output_tokens": 20, "cache_read_tokens": 36_000}
 
     assert "cache_read_tokens" not in _from_litellm_response(_make_response())["usage"]
+
+
+def test_from_litellm_reports_cache_writes():
+    result = _from_litellm_response(_make_response(prompt_tokens=40_000, cache_creation_tokens=36_000))
+    assert result["usage"] == {"input_tokens": 40_000, "output_tokens": 20, "cache_write_tokens": 36_000}
+
+    assert "cache_write_tokens" not in _from_litellm_response(_make_response())["usage"]
+
+
+def test_from_litellm_reports_the_model_that_served_the_call():
+    result = _from_litellm_response(_make_response(model="claude-sonnet-5-20260801"))
+    assert result["model"] == "claude-sonnet-5-20260801"
+
+    assert "model" not in _from_litellm_response(_make_response())
 
 
 def test_from_litellm_length_finish():
