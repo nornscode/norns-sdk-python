@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 dependencies = [
     "websockets>=12.0",
     # 1.96.1 shipped cp310-only wheels, breaking installs on 3.11+
-    "litellm>=1.60.0,!=1.96.1",
+    "litellm>=1.67.0,!=1.96.1",
     "httpx>=0.27.0",
 ]
 
