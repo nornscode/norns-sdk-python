@@ -29,7 +29,7 @@ def test_to_litellm_tools_multiple():
 
 
 def _make_response(content="Hello!", finish_reason="stop", tool_calls=None,
-                   prompt_tokens=100, completion_tokens=20):
+                   prompt_tokens=100, completion_tokens=20, cached_tokens=None):
     """Build a mock LiteLLM response."""
     message = MagicMock()
     message.content = content
@@ -42,6 +42,9 @@ def _make_response(content="Hello!", finish_reason="stop", tool_calls=None,
     usage = MagicMock()
     usage.prompt_tokens = prompt_tokens
     usage.completion_tokens = completion_tokens
+    usage.prompt_tokens_details = None
+    if cached_tokens is not None:
+        usage.prompt_tokens_details = MagicMock(cached_tokens=cached_tokens)
 
     response = MagicMock()
     response.choices = [choice]
@@ -87,6 +90,13 @@ def test_from_litellm_tool_call_dict_arguments():
     resp = _make_response(content="", finish_reason="tool_calls", tool_calls=[tc])
     result = _from_litellm_response(resp)
     assert result["tool_calls"][0]["arguments"] == {"q": "weather"}
+
+
+def test_from_litellm_reports_cache_reads():
+    result = _from_litellm_response(_make_response(prompt_tokens=40_000, cached_tokens=36_000))
+    assert result["usage"] == {"input_tokens": 40_000, "output_tokens": 20, "cache_read_tokens": 36_000}
+
+    assert "cache_read_tokens" not in _from_litellm_response(_make_response())["usage"]
 
 
 def test_from_litellm_length_finish():
@@ -296,3 +306,33 @@ def test_agent_registers_context_policy():
     agent = Agent(name="a", context_policy={"compact_at": 100_000, "keep": 30}, context_strategy="none")
     assert agent.to_registration()["context_policy"] == {"compact_at": 100_000, "keep": 30}
     assert Agent(name="b").to_registration()["context_policy"] is None
+
+
+def test_llm_call_caches_system_prompt_and_tail(monkeypatch):
+    import asyncio
+    from norns.client import Norns
+
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return _make_response(content="ok", finish_reason="stop")
+
+    monkeypatch.setattr("norns.client.litellm.completion", fake_completion)
+    client = Norns("http://localhost:4000", api_key="k")
+    client._llm_provider = "anthropic"
+
+    task = {
+        "system_prompt": "You help.",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "again"},
+        ],
+    }
+    asyncio.run(client._handle_llm_task(task))
+
+    assert captured["cache_control_injection_points"] == [
+        {"location": "message", "role": "system"},
+        {"location": "message", "index": 3},
+    ]

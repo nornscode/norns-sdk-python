@@ -679,6 +679,7 @@ class Norns:
                 "model": model,
                 "max_tokens": _max_tokens(task),
                 "messages": llm_messages,
+                "cache_control_injection_points": _cache_breakpoints(llm_messages),
             }
             if tools:
                 kwargs["tools"] = _to_litellm_tools(tools)
@@ -1257,6 +1258,20 @@ def _elide_old_tool_results(messages: list[dict]) -> list[dict]:
     return out + recent
 
 
+def _cache_breakpoints(llm_messages: list[dict]) -> list[dict]:
+    """Cache the system prompt and everything up to the newest message.
+
+    A run's history only grows between steps, so this call's tail is the
+    next call's prefix and gets read back at the cached rate. The points are
+    relative, so they follow compaction when it rewrites the history.
+    LiteLLM drops them for providers that cache on their own.
+    """
+    points = [{"location": "message", "role": "system"}]
+    if llm_messages:
+        points.append({"location": "message", "index": len(llm_messages) - 1})
+    return points
+
+
 def _final_output(messages: list[dict], content) -> str:
     """The run's output when the model stops. A turn can say something
     substantive alongside a tool call and then end with an empty "stop" turn;
@@ -1361,14 +1376,21 @@ def _from_litellm_response(response) -> dict:
     }
     finish_reason = finish_reason_map.get(choice.finish_reason, choice.finish_reason)
 
+    usage = {
+        "input_tokens": response.usage.prompt_tokens,
+        "output_tokens": response.usage.completion_tokens,
+    }
+    # input_tokens counts cache reads too; this says how many of them were.
+    details = getattr(response.usage, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None)
+    if isinstance(cached, int):
+        usage["cache_read_tokens"] = cached
+
     result: dict[str, Any] = {
         "status": "ok",
         "content": content,
         "finish_reason": finish_reason,
-        "usage": {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-        },
+        "usage": usage,
     }
     if tool_calls:
         result["tool_calls"] = tool_calls
