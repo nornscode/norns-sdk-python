@@ -196,6 +196,8 @@ class Norns:
         # What this worker has already done, by the idempotency key core
         # issued. Opened once the worker id is known (see _connect_and_serve).
         self._completed = _CompletedCalls(None)
+        # The message list core last sent us, per run (fresh per connection).
+        self._history = _HistoryCache()
 
     def run(
         self,
@@ -438,6 +440,9 @@ class Norns:
             "worker_id": worker_id,
             "tools": [t.to_registration() for t in _tools_by_name(agents).values()],
             "capabilities": ["llm", "tools"],
+            # This worker keeps the history it was last sent per run, so core
+            # may send later steps as the change only (see _HistoryCache).
+            "features": ["message_cache"],
             "agents": [a.to_registration() for a in agents],
         }
 
@@ -482,6 +487,9 @@ class Norns:
                 logger.info(f"Worker {worker_id} ready")
 
             self._ws = ws
+            # Core sends deltas only to the connection it sent the history
+            # on, so a new connection starts with nothing to be stale.
+            self._history = _HistoryCache()
 
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
@@ -615,6 +623,15 @@ class Norns:
 
     async def _run_llm_task(self, ws, payload: dict):
         """Handle one llm_task to completion: execute, log, send the result."""
+        resolved = self._history.resolve(payload)
+        if resolved is None:
+            # The delta was built on a history this worker no longer holds.
+            # Core resends the whole list at the same step; no retry counted.
+            logger.info("LLM task arrived as a delta on an unknown base; asking for the full history")
+            await self._try_send_result(ws, payload, {"status": "error", "error": "message_cache_miss"})
+            return
+        payload = resolved
+
         tools_list = [t.get("name") for t in payload.get("tools", [])]
         logger.info(
             f"LLM call → {payload.get('model', '?')} "
@@ -1237,6 +1254,54 @@ def _max_tokens(task: dict) -> int:
     """The agent's cap, from the task envelope, or ours."""
     value = task.get("max_tokens")
     return value if isinstance(value, int) and value > 0 else DEFAULT_MAX_TOKENS
+
+
+class _HistoryCache:
+    """The message list core last sent this worker, per run.
+
+    Once a worker joins with ``features: ["message_cache"]``, core sends a
+    run's later steps as the change since the last task on this connection:
+    ``messages_delta: {base_count, drop, append}`` — of the ``base_count``
+    messages held, drop the first ``drop``, append the rest. A delta against
+    a base this worker does not hold is a miss: the worker answers
+    ``message_cache_miss`` and core resends the whole list. Bounded by run
+    count; the run used longest ago goes first.
+    """
+
+    def __init__(self, max_runs: int = 256):
+        self._runs: dict[Any, list] = {}
+        self._max_runs = max_runs
+
+    def resolve(self, task: dict) -> dict | None:
+        """The task with ``messages`` filled in, or None on a miss."""
+        if task.get("purpose") == "compact":
+            # A prefix to summarise, not the history; leaves the cache alone.
+            return task
+
+        run_id = task.get("run_id")
+        delta = task.get("messages_delta")
+
+        if delta is None:
+            messages = task.get("messages")
+            if run_id is not None and isinstance(messages, list):
+                self._remember(run_id, messages)
+            return task
+
+        previous = self._runs.get(run_id)
+        if previous is None or len(previous) != delta.get("base_count"):
+            return None
+
+        messages = previous[delta.get("drop", 0):] + list(delta.get("append", []))
+        self._remember(run_id, messages)
+        resolved = {k: v for k, v in task.items() if k != "messages_delta"}
+        resolved["messages"] = messages
+        return resolved
+
+    def _remember(self, run_id, messages: list):
+        self._runs.pop(run_id, None)
+        self._runs[run_id] = messages
+        while len(self._runs) > self._max_runs:
+            del self._runs[next(iter(self._runs))]
 
 
 def _messages_for_task(task: dict) -> list[dict]:
