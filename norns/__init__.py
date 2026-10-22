@@ -8,7 +8,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0.dev0"
 
 from norns.agent import Agent, tool
-from norns.client import GardDestroyed, JoinError, Norns, NornsClient
+from norns.client import GardDestroyed, JoinError, KeyRevoked, Norns, NornsClient
 from norns.models import (
     AgentResponse,
     ConversationResponse,
@@ -27,6 +27,7 @@ __all__ = [
     "tool",
     "GardDestroyed",
     "JoinError",
+    "KeyRevoked",
     "AgentResponse",
     "ConversationResponse",
     "EventResponse",

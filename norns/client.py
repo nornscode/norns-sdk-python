@@ -126,6 +126,21 @@ class GardDestroyed(Exception):
     """The gard this worker claimed was destroyed while it was connected."""
 
 
+class KeyRevoked(Exception):
+    """The scoped key this worker joined on was revoked while it was
+    connected. Reconnecting with it can never succeed."""
+
+
+# A key issued by POST /api/v1/api_keys with a worker scope. It opens the
+# worker socket and nothing else, so a worker holding one must not try the
+# REST API. See docs/gards.md § Scoped Worker Keys in nornscode/norns.
+SCOPED_KEY_PREFIX = "nrnw_"
+
+
+def _scoped_key(api_key: str) -> bool:
+    return api_key.startswith(SCOPED_KEY_PREFIX)
+
+
 def _agent_list(agents: Agent | list[Agent] | tuple[Agent, ...]) -> list[Agent]:
     """One agent or several, as a list. Names must be unique: the second
     would overwrite the first on the server."""
@@ -189,6 +204,7 @@ class Norns:
         self._ws_url = self.url.replace("http://", "ws://").replace("https://", "wss://")
         self._gard: str | int | None = None
         self._claim_token: str | None = None
+        self._capabilities: list[str] = ["llm", "tools"]
         self._ws = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown: asyncio.Event | None = None
@@ -207,6 +223,7 @@ class Norns:
         worker_id: str | None = None,
         gard: str | int | None = None,
         claim_token: str | None = None,
+        capabilities: list[str] | None = None,
         shutdown_timeout: float | None = None,
     ):
         """Connect as a worker, register the agent, and handle tasks until
@@ -214,6 +231,16 @@ class Norns:
 
         Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
+
+        A worker holding a scoped key (`nrnw_...`, issued for one gard's
+        worker) skips the registration: the key can open the worker socket
+        and nothing else, so the agent definitions have to be registered by
+        whoever holds the tenant key. Everything else works as before.
+
+        `capabilities` says what this worker serves, `["llm", "tools"]` by
+        default; pass `["tools"]` for a worker with no LLM access. A scoped
+        key lists the capabilities it allows, and a join asking for more is
+        refused.
 
         Pass a list of agents to serve several from one process. Each is
         created or updated, and the worker registers the union of their
@@ -246,8 +273,19 @@ class Norns:
         # A bad combination fails before anything reaches the server.
         _tools_by_name(agents)
         _llm_provider(agents)
-        for a in agents:
-            self._ensure_agent(a)
+        if _scoped_key(self.api_key):
+            logger.info(
+                "Worker key is scoped (nrnw_): skipping agent registration. "
+                "Register the agent definitions with a tenant key."
+            )
+        else:
+            for a in agents:
+                self._ensure_agent(a)
+        if capabilities is not None:
+            unknown = sorted(set(capabilities) - {"llm", "tools"})
+            if unknown or not capabilities:
+                raise ValueError(f'capabilities must be a non-empty subset of ["llm", "tools"], got {capabilities}')
+            self._capabilities = list(dict.fromkeys(capabilities))
         # NORNS_GARD / NORNS_GARD_CLAIM_TOKEN mirror NORNS_WORKER_ID below:
         # a provisioner (volund) hands the worker its gard through the
         # environment so scaffolded workers need no code changes.
@@ -376,7 +414,7 @@ class Norns:
             while not self._shutdown.is_set():
                 try:
                     await self._connect_and_serve(agents, worker_id, tools_by_name)
-                except (JoinError, GardDestroyed):
+                except (JoinError, GardDestroyed, KeyRevoked):
                     # Retrying can never succeed — surface it instead of spinning.
                     raise
                 except JoinRetryable as e:
@@ -439,7 +477,7 @@ class Norns:
         payload = {
             "worker_id": worker_id,
             "tools": [t.to_registration() for t in _tools_by_name(agents).values()],
-            "capabilities": ["llm", "tools"],
+            "capabilities": list(self._capabilities),
             # This worker keeps the history it was last sent per run, so core
             # may send later steps as the change only (see _HistoryCache).
             "features": ["message_cache"],
@@ -531,6 +569,10 @@ class Norns:
                     elif event == "gard_destroyed":
                         logger.error("This worker's gard was destroyed — shutting down")
                         raise GardDestroyed(f"gard {self._gard} was destroyed")
+
+                    elif event == "key_revoked":
+                        logger.error("This worker's key was revoked — shutting down")
+                        raise KeyRevoked("the worker's scoped key was revoked")
 
                     elif event == "phx_error":
                         logger.error(f"Channel error: {payload}")
