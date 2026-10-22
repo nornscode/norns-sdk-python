@@ -61,6 +61,13 @@ norns.register_port(3000, name="react", url="http://localhost:3000")
 
 A fatally rejected claim (bad token, destroyed gard) raises `JoinError` instead of reconnect-looping; `GardDestroyed` is raised if the gard is destroyed while the worker is connected.
 
+A worker inside a gard should hold a [scoped key](https://github.com/nornscode/norns/blob/main/docs/gards.md#scoped-worker-keys) (`nrnw_...`) rather than the tenant key: it can join the worker socket, claim its gard and serve tasks, and nothing else. With one, `run()` skips the agent registration, since the key cannot reach the REST API; register the definitions with a tenant key instead. Pass `capabilities=["tools"]` for a worker with no LLM access, matching what the key allows. `KeyRevoked` is raised if the key is revoked while the worker is connected.
+
+```python
+norns = Norns(url, api_key=os.environ["NORNS_API_KEY"])  # nrnw_...
+norns.run(agent, gard=3, claim_token="tok_...", capabilities=["tools"])
+```
+
 ### Shutdown
 
 On SIGTERM or SIGINT the worker drains instead of dying mid-task: it tells Norns to stop sending it work, finishes the tasks it already holds, reports their results, leaves the channel, and `run()` returns. Tasks still running after `shutdown_timeout` seconds (default 30, or `NORNS_SHUTDOWN_TIMEOUT`) are dropped and Norns re-dispatches them. A second signal exits immediately.
