@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
@@ -140,7 +141,9 @@ class Agent:
     llm_provider: str = "anthropic"
     system_prompt: str = ""
     tools: list[ToolDef] = field(default_factory=list)
-    mode: str = "task"
+    # Deprecated and ignored. Norns never read it: a conversation is started
+    # by sending a message with a conversation_key, not by the definition.
+    mode: str | None = None
     checkpoint_policy: str = "on_tool_call"
     context_strategy: str = "sliding_window"
     context_window: int = 20
@@ -169,6 +172,13 @@ class Agent:
     subagent_conversation: str | None = None
 
     def __post_init__(self):
+        if self.mode is not None:
+            warnings.warn(
+                f"Agent '{self.name}': mode is deprecated and ignored; Norns never read it. "
+                "Start a conversation by sending a message with a conversation_key.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
         if self.subagent_conversation not in (None, *SUBAGENT_CONVERSATIONS):
             raise ValueError(
                 f"Agent '{self.name}': subagent_conversation must be one of "
@@ -191,7 +201,6 @@ class Agent:
             "name": self.name,
             "model": self.model,
             "system_prompt": self.system_prompt,
-            "mode": self.mode,
             "checkpoint_policy": self.checkpoint_policy,
             "context_strategy": self.context_strategy,
             "context_window": self.context_window,

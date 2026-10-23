@@ -358,7 +358,6 @@ class Norns:
         """
         headers = {"Authorization": f"Bearer {self.api_key}"}
         model_config = {
-            "mode": agent.mode,
             "checkpoint_policy": agent.checkpoint_policy,
             "context_strategy": agent.context_strategy,
             "context_window": agent.context_window,
