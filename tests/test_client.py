@@ -370,7 +370,7 @@ def test_list_runs_passes_limit(client):
 
 @respx.mock
 def test_list_runs_filters_by_status_and_agent(client):
-    respx.get(f"{BASE_URL}/api/v1/runs").mock(
+    route = respx.get(f"{BASE_URL}/api/v1/runs").mock(
         return_value=httpx.Response(200, json={"data": [
             _run_json(5, "waiting", agent_id=7),
             _run_json(4, "waiting", agent_id=9),
@@ -380,6 +380,15 @@ def test_list_runs_filters_by_status_and_agent(client):
     assert [r.run_id for r in client.list_runs(status="waiting")] == [5, 4]
     assert [r.run_id for r in client.list_runs(agent_id=7)] == [5, 3]
     assert [r.run_id for r in client.list_runs(status="waiting", agent_id=7)] == [5]
+
+    # The server does the filtering; the params go on the wire.
+    params = route.calls[-1].request.url.params
+    assert params["status"] == "waiting"
+    assert params["agent_id"] == "7"
+
+    client.list_runs()
+    unfiltered = route.calls[-1].request.url.params
+    assert "status" not in unfiltered and "agent_id" not in unfiltered
 
 
 @respx.mock
