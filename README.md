@@ -35,7 +35,6 @@ agent = Agent(
     model="claude-sonnet-5",
     system_prompt="You are a customer support agent. Look up docs and help customers.",
     tools=[search_docs, send_email],
-    mode="conversation",
     on_failure="retry_last_step",
 )
 
@@ -175,7 +174,6 @@ agent = Agent(
     model="claude-sonnet-5",
     system_prompt="You are helpful.",
     tools=[search, send_email],
-    mode="conversation",             # "task" or "conversation"
     checkpoint_policy="on_tool_call",  # "every_step", "on_tool_call", "manual"
     context_window=20,
     max_steps=50,

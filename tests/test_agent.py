@@ -75,7 +75,7 @@ def test_tool_registration_format():
 def test_agent_defaults():
     agent = Agent(name="test")
     assert agent.model == "claude-sonnet-5"
-    assert agent.mode == "task"
+    assert agent.mode is None
     assert agent.on_failure == "retry_last_step"
     assert agent.max_steps == 50
     assert agent.tools == []
@@ -102,15 +102,21 @@ def test_agent_registration_format():
         model="claude-haiku-4-5-20251001",
         system_prompt="You are helpful.",
         tools=[search],
-        mode="conversation",
     )
 
     reg = agent.to_registration()
     assert reg["name"] == "bot"
     assert reg["model"] == "claude-haiku-4-5-20251001"
     assert reg["system_prompt"] == "You are helpful."
-    assert reg["mode"] == "conversation"
+    assert "mode" not in reg
     assert reg["tools"] == ["search"]
+
+
+def test_mode_is_deprecated_and_not_sent():
+    with pytest.warns(DeprecationWarning, match="mode is deprecated"):
+        agent = Agent(name="bot", mode="conversation")
+
+    assert "mode" not in agent.to_registration()
 
 
 def test_agent_policy_fields_default_to_unset():
