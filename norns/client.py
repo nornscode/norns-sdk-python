@@ -1004,10 +1004,16 @@ class NornsClient:
             for run in client.list_runs(status="waiting"):
                 print(run.run_id, run.waiting_for.question)
 
-        ``status`` and ``agent_id`` filter the page the server returned, so a
-        narrow filter over a busy tenant may need a larger ``limit``.
+        ``status`` and ``agent_id`` are sent to the server, which filters
+        before applying ``limit``. (A Norns older than the filters ignores
+        them, so the page is filtered here as well.)
         """
-        resp = self._request("GET", "/api/v1/runs", params={"limit": limit})
+        params: dict = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        if agent_id is not None:
+            params["agent_id"] = agent_id
+        resp = self._request("GET", "/api/v1/runs", params=params)
         runs = [_parse_run(r) for r in resp.json()["data"]]
         if status is not None:
             runs = [r for r in runs if r.status == status]
