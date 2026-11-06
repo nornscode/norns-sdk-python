@@ -1187,8 +1187,8 @@ def _parse_agent(data: dict) -> AgentResponse:
     )
 
 
-# Chars kept of a tool result once it has aged out of the last two messages.
-# A context-cost policy, applied here because the worker is what holds the
+# Chars kept of a tool result from a turn that has been answered. A
+# context-cost policy, applied here because the worker is what holds the
 # plaintext; core forwards results untouched.
 TOOL_RESULT_CAP = 200
 
@@ -1360,17 +1360,27 @@ def _messages_for_task(task: dict) -> list[dict]:
 
 
 def _elide_old_tool_results(messages: list[dict]) -> list[dict]:
-    """Cap tool results older than the last two messages."""
-    if len(messages) <= 4:
-        return messages
-    old, recent = messages[:-2], messages[-2:]
+    """Cap tool results from before the turn in progress.
+
+    The turn is everything after the newest user message, and its results
+    stay whole however many there are. The model asked for them and has only
+    this list to answer from: a result capped before the turn ends is one it
+    answers without, and several calls in one step put all but the last few
+    out of reach before it has read any. Earlier turns have been answered,
+    so theirs are capped. A list with no user message is all one turn.
+
+    The cut also only moves when a turn starts, so within a run the history
+    sent is a prefix of the next step's and reads back from the cache.
+    """
+    turn = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=0)
     out = []
-    for msg in old:
+    for i, msg in enumerate(messages):
         content = msg.get("content")
-        if msg.get("role") == "tool" and isinstance(content, str) and len(content) > TOOL_RESULT_CAP:
+        if (i < turn and msg.get("role") == "tool"
+                and isinstance(content, str) and len(content) > TOOL_RESULT_CAP):
             msg = {**msg, "content": content[:TOOL_RESULT_CAP] + "...(truncated)"}
         out.append(msg)
-    return out + recent
+    return out
 
 
 def _cache_breakpoints(llm_messages: list[dict]) -> list[dict]:

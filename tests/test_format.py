@@ -216,19 +216,56 @@ def test_render_subagent_outcomes_keep_content_and_envelope_apart():
     assert json.loads(listed["content"]) == [{"name": "a", "purpose": ""}]
 
 
-def test_elide_old_tool_results_caps_only_aged_results():
+def test_elide_old_tool_results_caps_only_earlier_turns():
     long = "x" * 500
-    messages = [
+    earlier = [
         {"role": "user", "content": "go"},
         {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "t", "arguments": {}}]},
         {"role": "tool", "tool_call_id": "c1", "content": long},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "name": "t", "arguments": {}}]},
-        {"role": "tool", "tool_call_id": "c2", "content": long},
+        {"role": "assistant", "content": "done"},
     ]
-    out = _elide_old_tool_results(messages)
-    assert out[2]["content"] == "x" * 200 + "...(truncated)"
-    assert out[4]["content"] == long  # recent results stay whole
-    assert _elide_old_tool_results(messages[:4]) == messages[:4]  # four or fewer: untouched
+    assert _elide_old_tool_results(earlier) == earlier  # the only turn is the one in progress
+    out = _elide_old_tool_results(earlier + [{"role": "user", "content": "and now?"}])
+    assert out[2]["content"] == "x" * 200 + "...(truncated)"  # answered, so capped
+
+
+def test_elide_keeps_every_result_of_the_turn_in_progress():
+    # Three calls in one step, then another step: the model answers from all
+    # four results, so none is capped before the turn ends.
+    long = "x" * 500
+    calls = [{"id": f"c{i}", "name": "t", "arguments": {}} for i in range(3)]
+    messages = [
+        {"role": "user", "content": "check in"},
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        *[{"role": "tool", "tool_call_id": c["id"], "content": long} for c in calls],
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c3", "name": "t", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c3", "content": long},
+    ]
+    assert _elide_old_tool_results(messages) == messages
+    # A window that has slid past the user message is still one turn.
+    assert _elide_old_tool_results(messages[1:]) == messages[1:]
+
+
+def test_elided_history_is_a_prefix_of_the_next_steps():
+    # What one step sends must lead what the next sends, or the provider
+    # writes the run's history to its cache again on every step.
+    long = "x" * 500
+    messages = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c0", "name": "t", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c0", "content": long},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "go"},
+    ]
+    sent = _elide_old_tool_results(messages)
+    for i in range(1, 4):
+        messages = messages + [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "name": "t", "arguments": {}}]},
+            {"role": "tool", "tool_call_id": f"c{i}", "content": long},
+        ]
+        later = _elide_old_tool_results(messages)
+        assert later[:len(sent)] == sent
+        sent = later
 
 
 def test_final_output_falls_back_to_last_substantive_assistant_turn():
