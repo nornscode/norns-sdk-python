@@ -8,6 +8,7 @@ did, and answers the second dispatch from that.
 """
 
 import asyncio
+import os
 
 import pytest
 
@@ -209,3 +210,106 @@ def test_the_default_state_dir_is_per_user(monkeypatch, tmp_path):
     _CompletedCalls(path).add("k1", {"status": "ok"})
     if hasattr(os, "getuid"):
         assert (path.parent.stat().st_mode & 0o777) == 0o700
+
+
+posix_only = pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership and modes")
+
+
+def _forge(state_dir, worker_id="w1"):
+    """What another local user would plant: a record saying k1 was done."""
+    import json
+
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / f"{worker_id}.completed.json").write_text(
+        json.dumps({"k1": {"status": "ok", "result": "charged 10"}})
+    )
+
+
+def _charges_once_despite_forgery(monkeypatch):
+    charges = []
+
+    async def script(fake, norns):
+        fake.incoming.put_nowait(tool_task("t1", "charge_card", idempotency_key="k1", amount=10))
+        result = await asyncio.wait_for(fake.results.get(), 2)
+        assert "duplicate" not in result
+        assert result["result"] == "charged 10"
+
+    serve(monkeypatch, charging_agent(charges), script)
+    # The call really ran: the forged record was not believed.
+    return charges == [10]
+
+
+@posix_only
+def test_a_state_dir_others_can_write_is_refused(monkeypatch, tmp_path, caplog):
+    """Pre-created with loose permissions, it could hold forged records."""
+    state = tmp_path / "state"
+    _forge(state)
+    state.chmod(0o777)
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "lets other users in" in caplog.text
+
+
+@posix_only
+def test_a_state_dir_with_group_read_is_refused(monkeypatch, tmp_path, caplog):
+    state = tmp_path / "state"
+    _forge(state)
+    state.chmod(0o750)
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "lets other users in" in caplog.text
+
+
+def test_a_symlinked_state_dir_is_refused(monkeypatch, tmp_path, caplog):
+    real = tmp_path / "elsewhere"
+    _forge(real)
+    real.chmod(0o700)
+    (tmp_path / "state").symlink_to(real)
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "is a symlink" in caplog.text
+
+
+@posix_only
+def test_a_state_dir_owned_by_someone_else_is_refused(monkeypatch, tmp_path, caplog):
+    import os
+
+    state = tmp_path / "state"
+    _forge(state)
+    state.chmod(0o700)
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(state).st_uid + 1)
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "not this user" in caplog.text
+
+
+@posix_only
+def test_a_state_file_others_can_write_is_ignored(monkeypatch, tmp_path, caplog):
+    state = tmp_path / "state"
+    _forge(state)
+    state.chmod(0o700)
+    (state / "w1.completed.json").chmod(0o666)
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "lets other users in" in caplog.text
+
+
+def test_a_symlinked_state_file_is_ignored(monkeypatch, tmp_path, caplog):
+    elsewhere = tmp_path / "elsewhere"
+    _forge(elsewhere)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "w1.completed.json").symlink_to(elsewhere / "w1.completed.json")
+    assert _charges_once_despite_forgery(monkeypatch)
+    assert "is a symlink" in caplog.text
+
+
+@posix_only
+def test_a_private_state_dir_is_trusted_and_files_are_written_0600(monkeypatch, tmp_path):
+    """The checks must not refuse the dir this worker made itself, nor the
+    0644 files earlier versions wrote into it."""
+    from norns.client import _CompletedCalls
+
+    state = tmp_path / "state"
+    _forge(state)
+    state.chmod(0o700)
+    (state / "w1.completed.json").chmod(0o644)
+    calls = _CompletedCalls(state / "w1.completed.json")
+    assert "k1" in calls
+    calls.add("k2", {"status": "ok"})
+    assert ((state / "w1.completed.json").stat().st_mode & 0o777) == 0o600

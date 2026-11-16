@@ -409,21 +409,63 @@ def test_a_waiting_run_carries_its_question(client):
 
 @respx.mock
 def test_conversation_keys_are_escaped_in_the_path(client):
-    """A key is one path segment: "/" or "?" in it must not change which
+    """A key is one path segment: "?" or "#" in it must not change which
     conversation is addressed (deleting "a?b" must not delete "a")."""
     wrong = respx.delete(f"{BASE_URL}/api/v1/agents/1/conversations/a").mock(
         return_value=httpx.Response(204)
     )
-    right = respx.delete(f"{BASE_URL}/api/v1/agents/1/conversations/a%3Fb%2Fc").mock(
+    right = respx.delete(url__regex=r"/conversations/a%3Fb%23c$").mock(
         return_value=httpx.Response(204)
     )
-    client.delete_conversation(1, "a?b/c")
+    client.delete_conversation(1, "a?b#c")
     assert right.called
     assert not wrong.called
+    assert right.calls.last.request.url.raw_path == b"/api/v1/agents/1/conversations/a%3Fb%23c"
 
-    respx.get(f"{BASE_URL}/api/v1/agents/1/conversations/slack:C1%2Fthread").mock(
+    get = respx.get(url__regex=r"/conversations/slack%3AC1$").mock(
         return_value=httpx.Response(200, json={"data": {
-            "id": 11, "agent_id": 1, "key": "slack:C1/thread",
+            "id": 11, "agent_id": 1, "key": "slack:C1",
         }})
     )
-    assert client.get_conversation(1, "slack:C1/thread").key == "slack:C1/thread"
+    assert client.get_conversation(1, "slack:C1").key == "slack:C1"
+    assert get.calls.last.request.url.raw_path == b"/api/v1/agents/1/conversations/slack%3AC1"
+
+
+@pytest.mark.parametrize("key", ["..", ".", "", "a/b", "../../runs/1"])
+@respx.mock(assert_all_called=False)
+def test_a_conversation_key_cannot_escape_its_path_segment(respx_mock, client, key):
+    """quote() keeps "..", and the URL is normalised before sending, so
+    delete_conversation(1, "..") would DELETE /api/v1/agents/1 — the agent."""
+    agent = respx_mock.delete(f"{BASE_URL}/api/v1/agents/1").mock(return_value=httpx.Response(204))
+    anything = respx_mock.route().mock(return_value=httpx.Response(204))
+    with pytest.raises(ValueError, match="path segment"):
+        client.delete_conversation(1, key)
+    with pytest.raises(ValueError, match="path segment"):
+        client.get_conversation(1, key)
+    assert not agent.called
+    assert not anything.called
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.get_run(".."),
+    lambda c: c.get_events("../agents/1"),
+    lambda c: c.reply("..", "yes"),
+])
+@respx.mock(assert_all_called=False)
+def test_ids_in_paths_cannot_escape_their_segment(respx_mock, client, call):
+    """Every caller-supplied id put into a path is checked, not just keys.
+    (A string agent is looked up by name, so only the server's id reaches
+    the path.)"""
+    anything = respx_mock.route().mock(return_value=httpx.Response(204))
+    with pytest.raises(ValueError):
+        call(client)
+    assert not anything.called
+
+
+def test_segment_escapes_everything():
+    from norns.client import _segment
+
+    assert _segment(7) == "7"
+    assert _segment("a b:c@d%e?f#g") == "a%20b%3Ac%40d%25e%3Ff%23g"
+    assert _segment("...") == "..."
+    assert _segment("v1.2") == "v1.2"
