@@ -151,9 +151,13 @@ reached it — after a crash it has no way to know whether the charge went
 through. The worker does: it keeps the result against the key and answers
 the second dispatch from that, flagging it so the run's log records a
 `tool_duplicate` rather than what looks like a second charge. The memory is
-in-process and bounded, so it covers the orchestrator restarting, not the
-worker itself dying — for that, pass the key on to a provider that dedupes
-(most payment APIs take an idempotency key of their own).
+bounded (the last 512 keys) and kept on disk per worker id — under
+`NORNS_STATE_DIR`, or a per-user directory in the system temp dir; set
+`NORNS_STATE_DIR=""` to keep it in memory only — so it also covers the worker
+itself dying and coming back under the same `NORNS_WORKER_ID`. It is
+best-effort: for anything that must never happen twice, also pass the key on
+to a provider that dedupes (most payment APIs take an idempotency key of their
+own).
 
 Async handlers work too:
 

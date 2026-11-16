@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import time
 import re
 import tempfile
@@ -15,10 +16,12 @@ from collections import OrderedDict
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import litellm
 import websockets
+import websockets.sync.client
 
 from norns.agent import Agent, ToolDef
 from norns.models import (
@@ -43,14 +46,23 @@ class _CompletedCalls:
     thing the key is supposed to prevent.
 
     It is a crash guard, not a ledger. Bounded, best-effort, and never allowed
-    to take a worker down: if the file cannot be read or written, the worker
-    runs with memory alone and says so once.
+    to take a worker down: if the file cannot be read or written, or the dir
+    or file could have been written by another user, the worker runs with
+    memory alone and says so once.
     """
 
     def __init__(self, path: Path | None, limit: int = MAX_REMEMBERED_RESULTS):
         self.path = path
         self.limit = limit
         self._entries: OrderedDict[str, dict] = OrderedDict()
+        if self.path:
+            try:
+                _ensure_private_dir(self.path.parent)
+            except (OSError, InsecureStateError) as e:
+                # Fail closed: a dir someone else could have written to may
+                # hold forged records that would make this worker skip calls.
+                logger.error(f"{e}; completed calls will be kept in memory only")
+                self.path = None
         self._load()
 
     def __contains__(self, key: str) -> bool:
@@ -72,12 +84,17 @@ class _CompletedCalls:
         if not self.path:
             return
         try:
-            with open(self.path) as f:
+            # Only group/other *write* is refused: earlier versions wrote the
+            # file 0644, into a dir that was already 0700.
+            _check_private(self.path, os.lstat(self.path), stat.S_ISREG, "a regular file", 0o022)
+            with open(self.path, opener=_nofollow) as f:
                 for key, result in json.load(f).items():
                     self._entries[key] = result
             logger.debug(f"Loaded {len(self._entries)} completed call(s) from {self.path}")
         except FileNotFoundError:
             pass
+        except InsecureStateError as e:
+            logger.error(f"{e}; ignoring it and starting with no memory of completed calls")
         except Exception as e:
             logger.warning(f"Could not read {self.path} ({e}); starting with no memory of completed calls")
 
@@ -85,14 +102,55 @@ class _CompletedCalls:
         if not self.path:
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            with open(tmp, "w") as f:
+            with open(tmp, "w", opener=_private_nofollow) as f:
                 json.dump(self._entries, f)
             os.replace(tmp, self.path)
         except Exception as e:
             logger.warning(f"Could not write {self.path} ({e}); completed calls will not survive a restart")
             self.path = None
+
+
+class InsecureStateError(Exception):
+    """The worker state dir or file could be (or have been) written by
+    someone else, so what it says this worker already did can't be trusted."""
+
+
+def _check_private(path: Path, st: os.stat_result, is_kind, kind: str, forbidden: int) -> None:
+    """Raise unless `st` is a `kind` owned by this user with none of the
+    `forbidden` mode bits. Ownership and modes are POSIX-only."""
+    if stat.S_ISLNK(st.st_mode):
+        raise InsecureStateError(f"Norns state path {path} is a symlink; refusing to use it")
+    if not is_kind(st.st_mode):
+        raise InsecureStateError(f"Norns state path {path} is not {kind}; refusing to use it")
+    if not hasattr(os, "getuid"):
+        return
+    if st.st_uid != os.getuid():
+        raise InsecureStateError(
+            f"Norns state path {path} is owned by uid {st.st_uid}, not this user "
+            f"(uid {os.getuid()}); refusing to use it"
+        )
+    if st.st_mode & forbidden:
+        raise InsecureStateError(
+            f"Norns state path {path} has mode {stat.S_IMODE(st.st_mode):o}, which lets other "
+            f"users in; refusing to use it (restrict it to its owner, or remove it)"
+        )
+
+
+def _nofollow(path: str, flags: int) -> int:
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
+
+
+def _private_nofollow(path: str, flags: int) -> int:
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create the state dir 0700, then make sure it is really ours: another
+    local user could have made it first (or put a symlink there) and filled
+    it with forged completed-call records."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _check_private(path, os.lstat(path), stat.S_ISDIR, "a directory", 0o077)
 
 
 def _completed_calls_path(worker_id: str) -> Path | None:
@@ -105,7 +163,13 @@ def _completed_calls_path(worker_id: str) -> Path | None:
     base = os.environ.get("NORNS_STATE_DIR")
     if base == "":
         return None
-    root = Path(base) if base else Path(tempfile.gettempdir()) / "norns-worker-state"
+    if base:
+        root = Path(base)
+    else:
+        # The temp dir is shared by every user on the host; a shared state
+        # dir would let one user's file decide what another's worker skips.
+        user = os.getuid() if hasattr(os, "getuid") else os.environ.get("USERNAME", "")
+        root = Path(tempfile.gettempdir()) / f"norns-worker-state-{user}"
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", worker_id)[:120]
     return root / f"{safe}.completed.json"
 
@@ -135,6 +199,17 @@ class KeyRevoked(Exception):
 # worker socket and nothing else, so a worker holding one must not try the
 # REST API. See docs/gards.md § Scoped Worker Keys in nornscode/norns.
 SCOPED_KEY_PREFIX = "nrnw_"
+
+
+def _segment(value: int | str) -> str:
+    """One URL path segment from a caller-supplied id or key. Every byte is
+    escaped, and "", "." and ".." are refused: quote() leaves dots alone, so
+    a key of ".." would address the parent resource (DELETE on a conversation
+    would delete the agent)."""
+    text = str(value)
+    if text in ("", ".", "..") or "/" in text:
+        raise ValueError(f"Not a valid path segment: {value!r}")
+    return quote(text, safe="")
 
 
 def _scoped_key(api_key: str) -> bool:
@@ -389,7 +464,7 @@ class Norns:
 
             for a in existing:
                 if a["name"] == agent.name:
-                    resp = client.put(f"/api/v1/agents/{a['id']}", json=body)
+                    resp = client.put(f"/api/v1/agents/{_segment(a['id'])}", json=body)
                     resp.raise_for_status()
                     logger.info(f"Updated agent '{agent.name}' (id={a['id']})")
                     return
@@ -906,7 +981,7 @@ class NornsClient:
         If a string is passed, resolves by listing agents and filtering by name.
         """
         if isinstance(id_or_name, int):
-            resp = self._request("GET", f"/api/v1/agents/{id_or_name}")
+            resp = self._request("GET", f"/api/v1/agents/{_segment(id_or_name)}")
             return _parse_agent(resp.json()["data"])
 
         agents = self.list_agents()
@@ -949,7 +1024,7 @@ class NornsClient:
         if conversation_key is not None:
             body["conversation_key"] = conversation_key
 
-        resp = self._request("POST", f"/api/v1/agents/{agent_id}/messages", json=body)
+        resp = self._request("POST", f"/api/v1/agents/{_segment(agent_id)}/messages", json=body)
         data = resp.json()
         run_id = data["run_id"]
         status = data.get("status", "accepted")
@@ -986,7 +1061,7 @@ class NornsClient:
 
     def get_run(self, run_id: int) -> RunResponse:
         """Get details of a run."""
-        resp = self._request("GET", f"/api/v1/runs/{run_id}")
+        resp = self._request("GET", f"/api/v1/runs/{_segment(run_id)}")
         return _parse_run(resp.json()["data"])
 
     def list_runs(
@@ -1035,11 +1110,11 @@ class NornsClient:
                 print(result.waiting_for.question)
                 client.reply(result.run_id, "yes, go ahead")
         """
-        self._request("POST", f"/api/v1/runs/{run_id}/reply", json={"answer": answer})
+        self._request("POST", f"/api/v1/runs/{_segment(run_id)}/reply", json={"answer": answer})
 
     def get_events(self, run_id: int) -> list[EventResponse]:
         """Get the event log for a run."""
-        resp = self._request("GET", f"/api/v1/runs/{run_id}/events")
+        resp = self._request("GET", f"/api/v1/runs/{_segment(run_id)}/events")
         return [
             EventResponse(
                 id=e["id"],
@@ -1057,7 +1132,7 @@ class NornsClient:
     def list_conversations(self, agent: int | str) -> list[ConversationResponse]:
         """List conversations for an agent."""
         agent_id = self._resolve_agent_id(agent)
-        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations")
+        resp = self._request("GET", f"/api/v1/agents/{_segment(agent_id)}/conversations")
         return [
             ConversationResponse(
                 id=c["id"],
@@ -1072,7 +1147,7 @@ class NornsClient:
     def get_conversation(self, agent: int | str, key: str) -> ConversationResponse:
         """Get a specific conversation by key."""
         agent_id = self._resolve_agent_id(agent)
-        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations/{key}")
+        resp = self._request("GET", f"/api/v1/agents/{_segment(agent_id)}/conversations/{_segment(key)}")
         c = resp.json()["data"]
         return ConversationResponse(
             id=c["id"],
@@ -1085,7 +1160,7 @@ class NornsClient:
     def delete_conversation(self, agent: int | str, key: str) -> None:
         """Delete a conversation (reset)."""
         agent_id = self._resolve_agent_id(agent)
-        self._request("DELETE", f"/api/v1/agents/{agent_id}/conversations/{key}")
+        self._request("DELETE", f"/api/v1/agents/{_segment(agent_id)}/conversations/{_segment(key)}")
 
     # --- Streaming ---
 
@@ -1107,7 +1182,7 @@ class NornsClient:
         body: dict[str, Any] = {"content": content}
         if conversation_key is not None:
             body["conversation_key"] = conversation_key
-        resp = self._request("POST", f"/api/v1/agents/{agent_id}/messages", json=body)
+        resp = self._request("POST", f"/api/v1/agents/{_segment(agent_id)}/messages", json=body)
         run_id = resp.json()["run_id"]
 
         # Stream via WebSocket
@@ -1132,15 +1207,13 @@ def _stream_events(
         return str(ref_counter)
 
     with websockets.sync.client.connect(url) as ws:
-        ws.settimeout(timeout)
-
         # Join the agent channel
         join_ref = next_ref()
         join_msg = json.dumps([join_ref, next_ref(), topic, "phx_join", {"run_id": run_id}])
         ws.send(join_msg)
 
         # Wait for join reply
-        reply = json.loads(ws.recv())
+        reply = json.loads(ws.recv(timeout))
         if isinstance(reply, list) and len(reply) >= 5 and reply[3] == "phx_reply":
             status = reply[4].get("status")
             if status != "ok":
@@ -1149,7 +1222,7 @@ def _stream_events(
         # Read events
         while True:
             try:
-                raw = ws.recv()
+                raw = ws.recv(timeout)
             except TimeoutError:
                 raise TimeoutError(f"Stream timed out after {timeout}s")
 
