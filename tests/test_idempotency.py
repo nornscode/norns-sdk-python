@@ -186,3 +186,26 @@ def test_an_unwritable_state_dir_does_not_stop_the_worker(monkeypatch, tmp_path)
 
     serve(monkeypatch, charging_agent(charges), script)
     assert charges == [10]
+
+
+def test_the_default_state_dir_is_per_user(monkeypatch, tmp_path):
+    """The system temp dir is shared; another user's file must not be able to
+    tell this worker a call was already done."""
+    import os
+    import tempfile
+
+    from norns.client import _completed_calls_path
+
+    monkeypatch.delenv("NORNS_STATE_DIR")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    path = _completed_calls_path("w1")
+    assert path.parent != tmp_path / "norns-worker-state"
+    assert path.parent.parent == tmp_path
+    if hasattr(os, "getuid"):
+        assert str(os.getuid()) in path.parent.name
+
+    from norns.client import _CompletedCalls
+
+    _CompletedCalls(path).add("k1", {"status": "ok"})
+    if hasattr(os, "getuid"):
+        assert (path.parent.stat().st_mode & 0o777) == 0o700

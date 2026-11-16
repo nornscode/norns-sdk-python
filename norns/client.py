@@ -15,10 +15,12 @@ from collections import OrderedDict
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import litellm
 import websockets
+import websockets.sync.client
 
 from norns.agent import Agent, ToolDef
 from norns.models import (
@@ -85,7 +87,7 @@ class _CompletedCalls:
         if not self.path:
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
             with open(tmp, "w") as f:
                 json.dump(self._entries, f)
@@ -105,7 +107,13 @@ def _completed_calls_path(worker_id: str) -> Path | None:
     base = os.environ.get("NORNS_STATE_DIR")
     if base == "":
         return None
-    root = Path(base) if base else Path(tempfile.gettempdir()) / "norns-worker-state"
+    if base:
+        root = Path(base)
+    else:
+        # The temp dir is shared by every user on the host; a shared state
+        # dir would let one user's file decide what another's worker skips.
+        user = os.getuid() if hasattr(os, "getuid") else os.environ.get("USERNAME", "")
+        root = Path(tempfile.gettempdir()) / f"norns-worker-state-{user}"
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", worker_id)[:120]
     return root / f"{safe}.completed.json"
 
@@ -1072,7 +1080,7 @@ class NornsClient:
     def get_conversation(self, agent: int | str, key: str) -> ConversationResponse:
         """Get a specific conversation by key."""
         agent_id = self._resolve_agent_id(agent)
-        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations/{key}")
+        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations/{quote(key, safe=':@')}")
         c = resp.json()["data"]
         return ConversationResponse(
             id=c["id"],
@@ -1085,7 +1093,7 @@ class NornsClient:
     def delete_conversation(self, agent: int | str, key: str) -> None:
         """Delete a conversation (reset)."""
         agent_id = self._resolve_agent_id(agent)
-        self._request("DELETE", f"/api/v1/agents/{agent_id}/conversations/{key}")
+        self._request("DELETE", f"/api/v1/agents/{agent_id}/conversations/{quote(key, safe=':@')}")
 
     # --- Streaming ---
 
@@ -1132,15 +1140,13 @@ def _stream_events(
         return str(ref_counter)
 
     with websockets.sync.client.connect(url) as ws:
-        ws.settimeout(timeout)
-
         # Join the agent channel
         join_ref = next_ref()
         join_msg = json.dumps([join_ref, next_ref(), topic, "phx_join", {"run_id": run_id}])
         ws.send(join_msg)
 
         # Wait for join reply
-        reply = json.loads(ws.recv())
+        reply = json.loads(ws.recv(timeout))
         if isinstance(reply, list) and len(reply) >= 5 and reply[3] == "phx_reply":
             status = reply[4].get("status")
             if status != "ok":
@@ -1149,7 +1155,7 @@ def _stream_events(
         # Read events
         while True:
             try:
-                raw = ws.recv()
+                raw = ws.recv(timeout)
             except TimeoutError:
                 raise TimeoutError(f"Stream timed out after {timeout}s")
 

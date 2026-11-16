@@ -405,3 +405,25 @@ def test_a_waiting_run_carries_its_question(client):
     [run] = client.list_runs(status="waiting")
     assert run.is_waiting
     assert run.waiting_for.question.startswith("Ship the gard fix")
+
+
+@respx.mock
+def test_conversation_keys_are_escaped_in_the_path(client):
+    """A key is one path segment: "/" or "?" in it must not change which
+    conversation is addressed (deleting "a?b" must not delete "a")."""
+    wrong = respx.delete(f"{BASE_URL}/api/v1/agents/1/conversations/a").mock(
+        return_value=httpx.Response(204)
+    )
+    right = respx.delete(f"{BASE_URL}/api/v1/agents/1/conversations/a%3Fb%2Fc").mock(
+        return_value=httpx.Response(204)
+    )
+    client.delete_conversation(1, "a?b/c")
+    assert right.called
+    assert not wrong.called
+
+    respx.get(f"{BASE_URL}/api/v1/agents/1/conversations/slack:C1%2Fthread").mock(
+        return_value=httpx.Response(200, json={"data": {
+            "id": 11, "agent_id": 1, "key": "slack:C1/thread",
+        }})
+    )
+    assert client.get_conversation(1, "slack:C1/thread").key == "slack:C1/thread"
